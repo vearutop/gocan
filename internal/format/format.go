@@ -437,7 +437,7 @@ func receiverTypeInfo(decl ast.Decl) (string, bool, bool) {
 }
 
 func renderFile(fset *token.FileSet, file *ast.File, imports []ast.Decl, infos []declInfo, othersOrig []ast.Decl) ([]byte, error) {
-	commentIndex := buildCommentIndex(file, imports, othersOrig)
+	commentIndex := buildCommentIndex(fset, file, imports, othersOrig)
 
 	importFile := &ast.File{
 		Name:    file.Name,
@@ -485,7 +485,7 @@ func renderFile(fset *token.FileSet, file *ast.File, imports []ast.Decl, infos [
 	return out.Bytes(), nil
 }
 
-func buildCommentIndex(file *ast.File, imports []ast.Decl, othersOrig []ast.Decl) commentIndex {
+func buildCommentIndex(fset *token.FileSet, file *ast.File, imports []ast.Decl, othersOrig []ast.Decl) commentIndex {
 	idx := commentIndex{
 		inner:   make(map[ast.Decl][]*ast.CommentGroup),
 		leading: make(map[ast.Decl][]*ast.CommentGroup),
@@ -494,7 +494,7 @@ func buildCommentIndex(file *ast.File, imports []ast.Decl, othersOrig []ast.Decl
 		idx.headerComments = append(idx.headerComments, file.Doc)
 	}
 
-	importSpans := declSpans(imports)
+	importSpans := declSpansToLineEnd(fset, imports)
 	otherSpans := declSpans(othersOrig)
 
 	for _, cg := range file.Comments {
@@ -536,6 +536,28 @@ func declSpans(decls []ast.Decl) []span {
 	spans := make([]span, 0, len(decls))
 	for _, decl := range decls {
 		spans = append(spans, span{decl: decl, pos: decl.Pos(), end: decl.End()})
+	}
+	return spans
+}
+
+func declSpansToLineEnd(fset *token.FileSet, decls []ast.Decl) []span {
+	spans := make([]span, 0, len(decls))
+	for _, decl := range decls {
+		end := decl.End()
+		if f := fset.File(end); f != nil {
+			line := f.Line(end)
+			if line < f.LineCount() {
+				if next := f.LineStart(line + 1); next > 0 {
+					end = next - 1
+				}
+			} else {
+				end = f.Pos(f.Size())
+			}
+		}
+		if end < decl.Pos() {
+			end = decl.End()
+		}
+		spans = append(spans, span{decl: decl, pos: decl.Pos(), end: end})
 	}
 	return spans
 }

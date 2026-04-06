@@ -102,6 +102,24 @@ const A = 1
 	)
 }
 
+func TestImportInlineCommentPreserved(t *testing.T) {
+	src := `package p
+
+import _ "github.com/bool64/dev" // Include CI/Dev scripts to project.
+`
+
+	cfg := format.DefaultConfig()
+	out, err := format.FormatFile("test.go", []byte(src), cfg)
+	if err != nil {
+		t.Fatalf("format: %v", err)
+	}
+
+	outStr := string(out)
+	if !strings.Contains(outStr, `import _ "github.com/bool64/dev" // Include CI/Dev scripts to project.`) {
+		t.Fatalf("expected import inline comment to survive rearranging")
+	}
+}
+
 func TestConstTieBreakerByText(t *testing.T) {
 	src := `package p
 
