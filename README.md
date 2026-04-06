@@ -1,4 +1,4 @@
-# go-template
+# gocan
 
 [![Build Status](https://github.com/bool64/go-template/workflows/test-unit/badge.svg)](https://github.com/bool64/go-template/actions?query=branch%3Amaster+workflow%3Atest-unit)
 [![Coverage Status](https://codecov.io/gh/bool64/go-template/branch/master/graph/badge.svg)](https://codecov.io/gh/bool64/go-template)
@@ -7,44 +7,111 @@
 ![Code lines](https://sloc.xyz/github/bool64/go-template/?category=code)
 ![Comments](https://sloc.xyz/github/bool64/go-template/?category=comments)
 
-<!--- TODO Update README.md -->
+`gocan` formats Go source files into a user-defined canonical declaration order to make diffs and merges cleaner. 
+It is intentionally gofmt-like: you can rewrite files, list files that would change, or show diffs.
 
-Project template with GitHub actions for Go.
+## Features
 
-## Install
+- Canonical declaration ordering based on a simple JSON config.
+- gofmt-style controls: rewrite (`-w`), list (`-l`), or diff (`-d`).
+- Stable ordering inside each configured block (alphabetical by name).
+- Import declarations stay at the top in their original order.
+- Safe handling of `const` blocks: no splitting or spec reordering, preserving `iota` semantics.
+- Works on individual files or recursively on directories (skips `vendor` and dot-directories).
+- Optional helper attachment: unexported functions called by exactly one top-level parent are placed directly after that parent.
 
+## Quick Start
+
+```bash
+go install github.com/vearutop/gocan/cmd/gocan@latest
+gocan -w .
 ```
-go install github.com/bool64/go-template@latest
-$(go env GOPATH)/bin/go-template --help
-```
 
-Or download binary from [releases](https://github.com/bool64/go-template/releases).
+Or download binary from [releases](https://github.com/vearutop/gocan/releases).
 
 ### Linux AMD64
 
 ```
-wget https://github.com/bool64/go-template/releases/latest/download/linux_amd64.tar.gz && tar xf linux_amd64.tar.gz && rm linux_amd64.tar.gz
-./go-template -version
-```
-
-### Macos Intel
-
-```
-wget https://github.com/bool64/go-template/releases/latest/download/darwin_amd64.tar.gz && tar xf darwin_amd64.tar.gz && rm darwin_amd64.tar.gz
-codesign -s - ./go-template
-./go-template -version
-```
-
-### Macos Apple Silicon (M1, etc...)
-
-```
-wget https://github.com/bool64/go-template/releases/latest/download/darwin_arm64.tar.gz && tar xf darwin_arm64.tar.gz && rm darwin_arm64.tar.gz
-codesign -s - ./go-template
-./go-template -version
+wget https://github.com/vearutop/gocan/releases/latest/download/linux_amd64.tar.gz && tar xf linux_amd64.tar.gz && rm linux_amd64.tar.gz
+./gocan -version
 ```
 
 
-## Usage
+## Config
 
-Create a new repository from this template, check out it and run `./run_me.sh` to replace template name with name of
-your repository.
+Config is a JSON file defining declaration order. Each rule is matched by `kind` and `exported`. For `receiver` rules, `exportedMethod` controls method grouping within each receiver type. `packageMainFunc` ignores `exported`.
+
+Supported `kind` values:
+
+- `const`
+- `var`
+- `type`
+- `func`
+- `receiver` (methods grouped by receiver type)
+- `packageMainFunc` (`func main()` in `package main`)
+- `constructor` (functions named `New*`)
+
+Example:
+
+```json
+{
+  "order": [
+    {"kind": "packageMainFunc"},
+    {"kind": "const", "exported": true},
+    {"kind": "var", "exported": true},
+    {"kind": "func", "exported": true},
+    {"kind": "constructor", "exported": true},
+    {"kind": "type", "exported": true},
+    {"kind": "receiver", "exported": true, "exportedMethod": true},
+    {"kind": "receiver", "exported": true, "exportedMethod": false},
+    {"kind": "const", "exported": false},
+    {"kind": "var", "exported": false},
+    {"kind": "func", "exported": false},
+    {"kind": "constructor", "exported": false},
+    {"kind": "type", "exported": false},
+    {"kind": "receiver", "exported": false, "exportedMethod": true},
+    {"kind": "receiver", "exported": false, "exportedMethod": false}
+  ],
+  "helperAttachment": true,
+  "exclude": [
+    "**/*_generated.go",
+    "internal/legacy/**"
+  ]
+}
+```
+
+`helperAttachment` behavior:
+
+- Only unexported top-level functions with exactly one top-level caller in the same file are attached.
+- Attachment is transitive for single-parent chains (`top -> helperA -> helperB` results in `top, helperA, helperB`).
+- Helpers called by multiple parents remain in normal order.
+
+Run with:
+
+```bash
+./gocan -w -config gocan.json .
+```
+
+Config discovery:
+
+- If `-config` is provided, it is used for all files.
+- Otherwise, `gocan` searches for `.gocan.json` in the file's directory and its parents.
+- If no config is found, the built-in defaults apply.
+
+## CLI
+
+- `-w` rewrite files in place
+- `-l` list files whose formatting differs
+- `-d` display unified diffs
+- `-check` exit non-zero if any file is not formatted
+- `-config` path to JSON config file
+
+If no paths are provided (or `-` is given), `gocan` reads from stdin and writes to stdout.
+
+## Notes and Limitations
+
+- Const/var/type blocks are reordered as whole declarations. If a block mixes exported and unexported specs, it is classified by the first name.
+- Functions named `New*` are treated as constructors.
+- If two declarations tie on rule and name (e.g. multiple `const` blocks starting with `_`), the formatted declaration text is used as a deterministic tie-breaker.
+- Exclude patterns use `/` separators and support `*`, `?`, and `**` (any number of path segments), matched relative to the config file directory.
+- Helper attachment applies only to unexported top-level functions with exactly one top-level caller in the same file. Helpers called by multiple parents remain in normal order.

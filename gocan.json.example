@@ -1,0 +1,24 @@
+{
+  "order": [
+    {"kind": "packageMainFunc"},
+    {"kind": "const", "exported": true},
+    {"kind": "var", "exported": true},
+    {"kind": "func", "exported": true},
+    {"kind": "constructor", "exported": true},
+    {"kind": "type", "exported": true},
+    {"kind": "receiver", "exported": true, "exportedMethod": true},
+    {"kind": "receiver", "exported": true, "exportedMethod": false},
+    {"kind": "const", "exported": false},
+    {"kind": "var", "exported": false},
+    {"kind": "func", "exported": false},
+    {"kind": "constructor", "exported": false},
+    {"kind": "type", "exported": false},
+    {"kind": "receiver", "exported": false, "exportedMethod": true},
+    {"kind": "receiver", "exported": false, "exportedMethod": false}
+  ],
+  "helperAttachment": true,
+  "exclude": [
+    "**/*_generated.go",
+    "internal/legacy/**"
+  ]
+}
