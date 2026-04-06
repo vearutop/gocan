@@ -145,66 +145,53 @@ func ValidateConfig(cfg Config) error {
 	return nil
 }
 
-func adjustCommentGroups(base token.Pos, groups []*ast.CommentGroup) []*ast.CommentGroup {
-	if len(groups) == 0 {
-		return nil
-	}
-	if base > 1 {
-		base--
-	}
-	out := make([]*ast.CommentGroup, len(groups))
-	for i, g := range groups {
-		list := make([]*ast.Comment, len(g.List))
-		for j, c := range g.List {
-			nc := *c
-			nc.Slash = base
-			list[j] = &nc
+func classifyDecl(decl ast.Decl) (kind, name string, exported bool) {
+	switch d := decl.(type) {
+	case *ast.GenDecl:
+		switch d.Tok {
+		case token.CONST:
+			kind = "const"
+		case token.VAR:
+			kind = "var"
+		case token.TYPE:
+			kind = "type"
+		default:
+			kind = strings.ToLower(d.Tok.String())
 		}
-		out[i] = &ast.CommentGroup{List: list}
+
+		name = genDeclPrimaryName(d)
+		exported = ast.IsExported(name)
+		return kind, name, exported
+	case *ast.FuncDecl:
+		name = d.Name.Name
+		exported = ast.IsExported(name)
+		if d.Recv != nil {
+			return "method", name, exported
+		}
+		if strings.HasPrefix(name, "New") {
+			return "constructor", name, exported
+		}
+		return "func", name, exported
+	default:
+		return "unknown", "", false
 	}
-	return out
 }
 
-func attachHelpers(infos []declInfo) []declInfo {
-	children, attachedToRoot, helpers := helperAttachmentData(infos)
-
-	// sort children by helper name (case-insensitive), then tie, then original index
-	for parent := range children {
-		list := children[parent]
-		sort.SliceStable(list, func(i, j int) bool {
-			ai := infos[helpers[list[i]]]
-			bi := infos[helpers[list[j]]]
-			an := strings.ToLower(ai.Name)
-			bn := strings.ToLower(bi.Name)
-			if an != bn {
-				return an < bn
-			}
-			if ai.Key.Tie != bi.Key.Tie {
-				return ai.Key.Tie < bi.Key.Tie
-			}
-			return ai.Key.OrigIndex < bi.Key.OrigIndex
-		})
-		children[parent] = list
+func genDeclPrimaryName(d *ast.GenDecl) string {
+	if len(d.Specs) == 0 {
+		return ""
 	}
-
-	skipped := map[string]struct{}{}
-	for helper := range attachedToRoot {
-		skipped[helper] = struct{}{}
-	}
-
-	result := make([]declInfo, 0, len(infos))
-	for _, info := range infos {
-		if _, ok := skipped[info.Name]; ok && info.IsHelper {
-			continue
+	switch spec := d.Specs[0].(type) {
+	case *ast.ValueSpec:
+		if len(spec.Names) == 0 {
+			return ""
 		}
-		result = append(result, info)
-		if info.IsCallable {
-			if list, ok := children[info.Name]; ok {
-				result = append(result, expandHelpers(list, children, helpers, infos)...)
-			}
-		}
+		return spec.Names[0].Name
+	case *ast.TypeSpec:
+		return spec.Name.Name
+	default:
+		return ""
 	}
-	return result
 }
 
 func helperAttachmentData(infos []declInfo) (map[string][]string, map[string]struct{}, map[string]int) {
@@ -274,39 +261,6 @@ func helperAttachmentData(infos []declInfo) (map[string][]string, map[string]str
 	return children, attachedToRoot, helpers
 }
 
-func resolveRootParent(helper string, attached map[string]string, helpers map[string]int, infos []declInfo, callers map[string]int) string {
-	seen := map[string]struct{}{}
-	cur := helper
-	for {
-		if _, ok := seen[cur]; ok {
-			return ""
-		}
-		seen[cur] = struct{}{}
-		parent, ok := attached[cur]
-		if !ok {
-			return ""
-		}
-		if _, ok := callers[parent]; !ok {
-			return ""
-		}
-		if _, ok := attached[parent]; !ok {
-			return parent
-		}
-		cur = parent
-	}
-}
-
-func expandHelpers(list []string, children map[string][]string, helpers map[string]int, infos []declInfo) []declInfo {
-	var out []declInfo
-	for _, name := range list {
-		out = append(out, infos[helpers[name]])
-		if kids, ok := children[name]; ok {
-			out = append(out, expandHelpers(kids, children, helpers, infos)...)
-		}
-	}
-	return out
-}
-
 func collectCalls(body *ast.BlockStmt) []string {
 	if body == nil {
 		return nil
@@ -327,113 +281,26 @@ func collectCalls(body *ast.BlockStmt) []string {
 	return calls
 }
 
-func classifyDecl(decl ast.Decl) (kind, name string, exported bool) {
-	switch d := decl.(type) {
-	case *ast.GenDecl:
-		switch d.Tok {
-		case token.CONST:
-			kind = "const"
-		case token.VAR:
-			kind = "var"
-		case token.TYPE:
-			kind = "type"
-		default:
-			kind = strings.ToLower(d.Tok.String())
-		}
-
-		name = genDeclPrimaryName(d)
-		exported = ast.IsExported(name)
-		return kind, name, exported
-	case *ast.FuncDecl:
-		name = d.Name.Name
-		exported = ast.IsExported(name)
-		if d.Recv != nil {
-			return "method", name, exported
-		}
-		if strings.HasPrefix(name, "New") {
-			return "constructor", name, exported
-		}
-		return "func", name, exported
-	default:
-		return "unknown", "", false
-	}
-}
-
-func genDeclPrimaryName(d *ast.GenDecl) string {
-	if len(d.Specs) == 0 {
-		return ""
-	}
-	switch spec := d.Specs[0].(type) {
-	case *ast.ValueSpec:
-		if len(spec.Names) == 0 {
+func resolveRootParent(helper string, attached map[string]string, helpers map[string]int, infos []declInfo, callers map[string]int) string {
+	seen := map[string]struct{}{}
+	cur := helper
+	for {
+		if _, ok := seen[cur]; ok {
 			return ""
 		}
-		return spec.Names[0].Name
-	case *ast.TypeSpec:
-		return spec.Name.Name
-	default:
-		return ""
-	}
-}
-
-func declText(fset *token.FileSet, decl ast.Decl) (string, error) {
-	var buf bytes.Buffer
-	if err := format.Node(&buf, fset, decl); err != nil {
-		return "", err
-	}
-	return buf.String(), nil
-}
-
-func isCallableDecl(decl ast.Decl) bool {
-	fn, ok := decl.(*ast.FuncDecl)
-	return ok && fn.Recv == nil
-}
-
-func orderIndexFor(cfg Config, kind string, exported bool) int {
-	for i, rule := range cfg.Order {
-		if rule.Kind != kind {
-			continue
+		seen[cur] = struct{}{}
+		parent, ok := attached[cur]
+		if !ok {
+			return ""
 		}
-		if kind == "packageMainFunc" || rule.Exported == exported {
-			return i
+		if _, ok := callers[parent]; !ok {
+			return ""
 		}
-	}
-	if kind == "packageMainFunc" {
-		return orderIndexFor(cfg, "func", false)
-	}
-	return len(cfg.Order) + 1
-}
-
-func receiverMethodGroup(cfg Config, receiverExported, methodExported bool) int {
-	for i, rule := range cfg.Order {
-		if rule.Kind != "receiver" {
-			continue
+		if _, ok := attached[parent]; !ok {
+			return parent
 		}
-		if rule.Exported == receiverExported && rule.ExportedMethod == methodExported {
-			return i
-		}
+		cur = parent
 	}
-	if methodExported {
-		return 0
-	}
-	return 1
-}
-
-func receiverTypeInfo(decl ast.Decl) (string, bool, bool) {
-	fn, ok := decl.(*ast.FuncDecl)
-	if !ok || fn.Recv == nil || len(fn.Recv.List) == 0 {
-		return "", false, false
-	}
-	t := fn.Recv.List[0].Type
-	switch v := t.(type) {
-	case *ast.Ident:
-		return v.Name, ast.IsExported(v.Name), true
-	case *ast.StarExpr:
-		if id, ok := v.X.(*ast.Ident); ok {
-			return id.Name, ast.IsExported(id.Name), true
-		}
-	}
-	return "", false, false
 }
 
 func renderFile(fset *token.FileSet, file *ast.File, imports []ast.Decl, infos []declInfo, othersOrig []ast.Decl) ([]byte, error) {
@@ -524,14 +391,6 @@ func buildCommentIndex(fset *token.FileSet, file *ast.File, imports []ast.Decl, 
 	return idx
 }
 
-type commentIndex struct {
-	importComments []*ast.CommentGroup
-	headerComments []*ast.CommentGroup
-	inner          map[ast.Decl][]*ast.CommentGroup
-	leading        map[ast.Decl][]*ast.CommentGroup
-	trailing       []*ast.CommentGroup
-}
-
 func declSpans(decls []ast.Decl) []span {
 	spans := make([]span, 0, len(decls))
 	for _, decl := range decls {
@@ -578,6 +437,147 @@ func findNextDecl(spans []span, cg *ast.CommentGroup) ast.Decl {
 		}
 	}
 	return nil
+}
+
+func adjustCommentGroups(base token.Pos, groups []*ast.CommentGroup) []*ast.CommentGroup {
+	if len(groups) == 0 {
+		return nil
+	}
+	if base > 1 {
+		base--
+	}
+	out := make([]*ast.CommentGroup, len(groups))
+	for i, g := range groups {
+		list := make([]*ast.Comment, len(g.List))
+		for j, c := range g.List {
+			nc := *c
+			nc.Slash = base
+			list[j] = &nc
+		}
+		out[i] = &ast.CommentGroup{List: list}
+	}
+	return out
+}
+
+func attachHelpers(infos []declInfo) []declInfo {
+	children, attachedToRoot, helpers := helperAttachmentData(infos)
+
+	// sort children by helper name (case-insensitive), then tie, then original index
+	for parent := range children {
+		list := children[parent]
+		sort.SliceStable(list, func(i, j int) bool {
+			ai := infos[helpers[list[i]]]
+			bi := infos[helpers[list[j]]]
+			an := strings.ToLower(ai.Name)
+			bn := strings.ToLower(bi.Name)
+			if an != bn {
+				return an < bn
+			}
+			if ai.Key.Tie != bi.Key.Tie {
+				return ai.Key.Tie < bi.Key.Tie
+			}
+			return ai.Key.OrigIndex < bi.Key.OrigIndex
+		})
+		children[parent] = list
+	}
+
+	skipped := map[string]struct{}{}
+	for helper := range attachedToRoot {
+		skipped[helper] = struct{}{}
+	}
+
+	result := make([]declInfo, 0, len(infos))
+	for _, info := range infos {
+		if _, ok := skipped[info.Name]; ok && info.IsHelper {
+			continue
+		}
+		result = append(result, info)
+		if info.IsCallable {
+			if list, ok := children[info.Name]; ok {
+				result = append(result, expandHelpers(list, children, helpers, infos)...)
+			}
+		}
+	}
+	return result
+}
+
+func declText(fset *token.FileSet, decl ast.Decl) (string, error) {
+	var buf bytes.Buffer
+	if err := format.Node(&buf, fset, decl); err != nil {
+		return "", err
+	}
+	return buf.String(), nil
+}
+
+func expandHelpers(list []string, children map[string][]string, helpers map[string]int, infos []declInfo) []declInfo {
+	var out []declInfo
+	for _, name := range list {
+		out = append(out, infos[helpers[name]])
+		if kids, ok := children[name]; ok {
+			out = append(out, expandHelpers(kids, children, helpers, infos)...)
+		}
+	}
+	return out
+}
+
+func isCallableDecl(decl ast.Decl) bool {
+	fn, ok := decl.(*ast.FuncDecl)
+	return ok && fn.Recv == nil
+}
+
+func orderIndexFor(cfg Config, kind string, exported bool) int {
+	for i, rule := range cfg.Order {
+		if rule.Kind != kind {
+			continue
+		}
+		if kind == "packageMainFunc" || rule.Exported == exported {
+			return i
+		}
+	}
+	if kind == "packageMainFunc" {
+		return orderIndexFor(cfg, "func", false)
+	}
+	return len(cfg.Order) + 1
+}
+
+func receiverMethodGroup(cfg Config, receiverExported, methodExported bool) int {
+	for i, rule := range cfg.Order {
+		if rule.Kind != "receiver" {
+			continue
+		}
+		if rule.Exported == receiverExported && rule.ExportedMethod == methodExported {
+			return i
+		}
+	}
+	if methodExported {
+		return 0
+	}
+	return 1
+}
+
+func receiverTypeInfo(decl ast.Decl) (string, bool, bool) {
+	fn, ok := decl.(*ast.FuncDecl)
+	if !ok || fn.Recv == nil || len(fn.Recv.List) == 0 {
+		return "", false, false
+	}
+	t := fn.Recv.List[0].Type
+	switch v := t.(type) {
+	case *ast.Ident:
+		return v.Name, ast.IsExported(v.Name), true
+	case *ast.StarExpr:
+		if id, ok := v.X.(*ast.Ident); ok {
+			return id.Name, ast.IsExported(id.Name), true
+		}
+	}
+	return "", false, false
+}
+
+type commentIndex struct {
+	importComments []*ast.CommentGroup
+	headerComments []*ast.CommentGroup
+	inner          map[ast.Decl][]*ast.CommentGroup
+	leading        map[ast.Decl][]*ast.CommentGroup
+	trailing       []*ast.CommentGroup
 }
 
 func (c commentIndex) commentsForDecl(decl ast.Decl) []*ast.CommentGroup {

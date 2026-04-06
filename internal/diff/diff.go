@@ -11,10 +11,6 @@ import (
 	"strings"
 )
 
-// A pair is a pair of values tracked for both the x and y side of a diff.
-// It is typically a pair of line indexes.
-type pair struct{ x, y int }
-
 // Diff returns an anchored diff of the two texts old and new
 // in the "unified diff" format. If old and new are identical,
 // Diff returns a nil slice (no output).
@@ -163,21 +159,6 @@ func Diff(oldName string, old []byte, newName string, new []byte) []byte {
 	return out.Bytes()
 }
 
-// lines returns the lines in the file x, including newlines.
-// If the file does not end in a newline, one is supplied
-// along with a warning about the missing newline.
-func lines(x []byte) []string {
-	l := strings.SplitAfter(string(x), "\n")
-	if l[len(l)-1] == "" {
-		l = l[:len(l)-1]
-	} else {
-		// Treat last line as having a message about the missing newline attached,
-		// using the same text as BSD/GNU diff (including the leading backslash).
-		l[len(l)-1] += "\n\\ No newline at end of file\n"
-	}
-	return l
-}
-
 // tgs returns the pairs of indexes of the longest common subsequence
 // of unique lines in x and y, where a unique line is one that appears
 // once in x and once in y.
@@ -304,3 +285,22 @@ func lis(seq []pair, y int) (int, int) {
 	}
 	return hi, lo
 }
+
+// lines returns the lines in the file x, including newlines.
+// If the file does not end in a newline, one is supplied
+// along with a warning about the missing newline.
+func lines(x []byte) []string {
+	l := strings.SplitAfter(string(x), "\n")
+	if l[len(l)-1] == "" {
+		l = l[:len(l)-1]
+	} else {
+		// Treat last line as having a message about the missing newline attached,
+		// using the same text as BSD/GNU diff (including the leading backslash).
+		l[len(l)-1] += "\n\\ No newline at end of file\n"
+	}
+	return l
+}
+
+// A pair is a pair of values tracked for both the x and y side of a diff.
+// It is typically a pair of line indexes.
+type pair struct{ x, y int }
