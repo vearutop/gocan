@@ -105,8 +105,32 @@ Config discovery:
 - `-d` display unified diffs
 - `-check` exit non-zero if any file is not formatted
 - `-config` path to JSON config file
+- `-gh-annotate` emit GitHub Actions annotations for layout-only changes
+- `-gh-head` git head ref/sha for `-gh-annotate` (default `HEAD`)
+- `-gh-message` annotation message for `-gh-annotate`
+- `-gh-base` git base ref/sha for `-gh-annotate` (defaults to `GITHUB_BASE_SHA`, falls back to `origin/main` if empty)
 
 If no paths are provided (or `-` is given), `gocan` reads from stdin and writes to stdout.
+
+## GitHub Actions Annotations
+
+`gocan` can emit GitHub Actions annotations that mark layout-only changes (i.e., changes that disappear after canonicalization). This helps reviewers focus on semantic changes.
+
+Example workflow step:
+
+```yaml
+- name: Layout-only annotations
+  env:
+    BASE_SHA: ${{ github.event.pull_request.base.sha }}
+  run: |
+    gocan -gh-annotate -gh-base "$BASE_SHA"
+```
+
+Notes:
+- `-gh-annotate` ignores new files that don't exist in the base ref.
+- If `-gh-base` is not provided, `gocan` uses `GITHUB_BASE_SHA` if set, otherwise tries `origin/main`, `origin/master`, `main`, `master` (in that order).
+- Set `GOCAN_DEBUG=1` to print debug logs and a final summary to stderr.
+- In mixed files (layout-only moves plus semantic edits), annotations target only unchanged declarations whose text matches base after canonicalization.
 
 ## Notes and Limitations
 

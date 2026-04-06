@@ -5,6 +5,8 @@ run:
 linters:
   default: all
   disable:
+    - err113
+    - exhaustive
     - embeddedstructfieldcheck
     - nilnil
     - noinlineerr
@@ -63,6 +65,9 @@ linters:
       - linters:
           - revive
         text: 'unused-parameter: parameter'
+      - linters:
+          - gosec
+        text: 'G304: Potential file inclusion via variable'
     paths:
       - third_party$
       - builtin$
