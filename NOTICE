@@ -1,0 +1,5 @@
+This project includes code derived from the Go project:
+
+- internal/diff/diff.go is adapted from https://go.dev/src/internal/diff/diff.go
+  Copyright 2022 The Go Authors.
+  Licensed under the BSD 3-Clause License.

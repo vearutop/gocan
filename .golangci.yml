@@ -1,65 +1,97 @@
-# See https://github.com/golangci/golangci-lint/blob/master/.golangci.example.yml
+# See https://golangci-lint.run/docs/linters/configuration/
+version: "2"
 run:
   tests: true
-
-linters-settings:
-  errcheck:
-    check-type-assertions: true
-    check-blank: true
-  gocyclo:
-    min-complexity: 20
-  dupl:
-    threshold: 100
-  misspell:
-    locale: US
-  unused:
-    check-exported: false
-  unparam:
-    check-exported: true
-
 linters:
-  enable-all: true
+  default: all
   disable:
-    - lll
-    - gochecknoglobals
-    - gomnd
-    - wrapcheck
-    - paralleltest
+    - err113
+    - exhaustive
+    - embeddedstructfieldcheck
+    - nilnil
+    - noinlineerr
+    - wsl
+    - wsl_v5
+    - nlreturn
+    - funcorder
+    - copyloopvar
+    - depguard
+    - dupword
+    - errname
+    - exhaustruct
     - forbidigo
     - forcetypeassert
-    - varnamelen
-    - tagliatelle
-    - errname
+    - gochecknoglobals
+    - intrange
     - ireturn
-    - exhaustruct
-    - nonamedreturns
-    - testableexamples
-    - dupword
-    - depguard
-    - tagalign
-    - execinquery
+    - lll
     - mnd
+    - nonamedreturns
+    - paralleltest
+    - recvcheck
+    - tagalign
+    - tagliatelle
+    - testableexamples
     - testifylint
-
-issues:
-  exclude-use-default: false
-  exclude-rules:
-    - linters:
-        - gomnd
-        - mnd
-        - goconst
-        - noctx
-        - funlen
-        - dupl
-        - structcheck
-        - unused
-        - unparam
-      path: "_test.go"
-    - linters:
-        - errcheck # Error checking omitted for brevity.
-        - gosec
-      path: "example_"
-    - linters:
-        - revive
-      text: "unused-parameter: parameter"
-
+    - varnamelen
+    - wrapcheck
+  settings:
+    cyclop:
+      max-complexity: 20
+    dupl:
+      threshold: 100
+    errcheck:
+      check-type-assertions: true
+      check-blank: true
+    gocyclo:
+      min-complexity: 20
+    gocognit:
+      min-complexity: 45
+    misspell:
+      locale: US
+    wsl_v5:
+      allow-first-in-block: true
+      allow-whole-block: true
+      branch-max-lines: 2
+    unparam:
+      check-exported: true
+  exclusions:
+    generated: lax
+    rules:
+      - linters:
+          - gosec
+          - dupl
+          - funlen
+          - goconst
+          - mnd
+          - noctx
+          - unparam
+          - unused
+        path: _test.go
+      - linters:
+          - errcheck
+          - gosec
+        path: example_
+      - linters:
+          - revive
+        text: 'unused-parameter: parameter'
+      - linters:
+          - gosec
+        text: 'G304: Potential file inclusion via variable'
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+      - internal/diff
+formatters:
+  enable:
+    - gci
+    - gofmt
+    - gofumpt
+    - goimports
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
