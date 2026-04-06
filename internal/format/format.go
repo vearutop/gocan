@@ -13,66 +13,33 @@ import (
 	"strings"
 )
 
+const (
+	kindFunc            = "func"
+	kindPackageMainFunc = "packageMainFunc"
+)
+
+// CanonicalizePath normalizes the path for file system access.
 func CanonicalizePath(path string) string {
 	return filepath.Clean(path)
 }
 
+// FormatFile rewrites Go source into canonical declaration order.
+//
+//nolint:revive // Kept for API compatibility.
 func FormatFile(path string, src []byte, cfg Config) ([]byte, error) {
 	fset := token.NewFileSet()
+
 	file, err := parser.ParseFile(fset, path, src, parser.ParseComments)
 	if err != nil {
 		return nil, err
 	}
 
-	imports := make([]ast.Decl, 0, len(file.Decls))
-	others := make([]ast.Decl, 0, len(file.Decls))
-
-	for _, decl := range file.Decls {
-		if gen, ok := decl.(*ast.GenDecl); ok && gen.Tok == token.IMPORT {
-			imports = append(imports, decl)
-			continue
-		}
-		others = append(others, decl)
-	}
-
+	imports, others := splitDecls(file)
 	othersOrig := append([]ast.Decl(nil), others...)
-	infos := make([]declInfo, len(others))
-	for i, decl := range others {
-		kind, name, exported := classifyDecl(decl)
-		if kind == "func" && name == "main" && file.Name != nil && file.Name.Name == "main" {
-			kind = "packageMainFunc"
-		}
-		orderIndex := orderIndexFor(cfg, kind, exported)
-		tie, _ := declText(fset, decl)
 
-		key := declKey{
-			OrderIndex: orderIndex,
-			Name:       strings.ToLower(name),
-			Tie:        tie,
-			OrigIndex:  i,
-		}
-		if kind == "method" {
-			if recvName, recvExported, ok := receiverTypeInfo(decl); ok {
-				key.OrderIndex = orderIndexFor(cfg, "type", recvExported)
-				key.Name = strings.ToLower(recvName)
-				key.SubOrder = 1
-				key.MethodGroup = receiverMethodGroup(cfg, recvExported, exported)
-				key.MethodName = strings.ToLower(name)
-			}
-		} else if kind == "type" {
-			key.SubOrder = 0
-		}
-		isCallable := isCallableDecl(decl)
-		isHelper := kind == "func" && !exported && isCallable
-		infos[i] = declInfo{
-			Decl:       decl,
-			Key:        key,
-			Kind:       kind,
-			Exported:   exported,
-			Name:       name,
-			IsHelper:   isHelper,
-			IsCallable: isCallable,
-		}
+	infos, err := buildDeclInfos(fset, file, others, cfg)
+	if err != nil {
+		return nil, err
 	}
 
 	if cfg.HelperAttachment {
@@ -86,6 +53,87 @@ func FormatFile(path string, src []byte, cfg Config) ([]byte, error) {
 		}
 	}
 
+	sortDeclInfos(infos)
+
+	if cfg.HelperAttachment {
+		infos = attachHelpers(infos)
+	}
+
+	file.Decls = file.Decls[:0]
+
+	file.Decls = append(file.Decls, imports...)
+	for _, info := range infos {
+		file.Decls = append(file.Decls, info.Decl)
+	}
+
+	return renderFile(fset, file, imports, infos, othersOrig)
+}
+
+func splitDecls(file *ast.File) ([]ast.Decl, []ast.Decl) {
+	imports := make([]ast.Decl, 0, len(file.Decls))
+
+	others := make([]ast.Decl, 0, len(file.Decls))
+	for _, decl := range file.Decls {
+		if gen, ok := decl.(*ast.GenDecl); ok && gen.Tok == token.IMPORT {
+			imports = append(imports, decl)
+
+			continue
+		}
+		others = append(others, decl)
+	}
+
+	return imports, others
+}
+
+func buildDeclInfos(fset *token.FileSet, file *ast.File, others []ast.Decl, cfg Config) ([]declInfo, error) {
+	infos := make([]declInfo, len(others))
+	for i, decl := range others {
+		kind, name, exported := classifyDecl(decl)
+		if kind == kindFunc && name == "main" && file.Name != nil && file.Name.Name == "main" {
+			kind = kindPackageMainFunc
+		}
+		orderIndex := orderIndexFor(cfg, kind, exported)
+
+		tie, err := declText(fset, decl)
+		if err != nil {
+			return nil, err
+		}
+		key := declKey{
+			OrderIndex: orderIndex,
+			Name:       strings.ToLower(name),
+			Tie:        tie,
+			OrigIndex:  i,
+		}
+
+		switch kind {
+		case "method":
+			if recvName, recvExported, ok := receiverTypeInfo(decl); ok {
+				key.OrderIndex = orderIndexFor(cfg, "type", recvExported)
+				key.Name = strings.ToLower(recvName)
+				key.SubOrder = 1
+				key.MethodGroup = receiverMethodGroup(cfg, recvExported, exported)
+				key.MethodName = strings.ToLower(name)
+			}
+		case "type":
+			key.SubOrder = 0
+		}
+		isCallable := isCallableDecl(decl)
+		isHelper := kind == kindFunc && !exported && isCallable
+		infos[i] = declInfo{
+			Decl:       decl,
+			Key:        key,
+			Kind:       kind,
+			Exported:   exported,
+			Name:       name,
+			IsHelper:   isHelper,
+			IsCallable: isCallable,
+		}
+	}
+
+	return infos, nil
+}
+
+func sortDeclInfos(infos []declInfo) {
 	sort.SliceStable(infos, func(i, j int) bool {
 		ki := infos[i].Key
 		kj := infos[j].Key
@@ -110,38 +158,29 @@ func FormatFile(path string, src []byte, cfg Config) ([]byte, error) {
 		if ki.Tie != kj.Tie {
 			return ki.Tie < kj.Tie
 		}
+
 		return ki.OrigIndex < kj.OrigIndex
 	})
-
-	if cfg.HelperAttachment {
-		infos = attachHelpers(infos)
-	}
-
-	file.Decls = file.Decls[:0]
-	file.Decls = append(file.Decls, imports...)
-	for _, info := range infos {
-		file.Decls = append(file.Decls, info.Decl)
-	}
-
-	return renderFile(fset, file, imports, infos, othersOrig)
 }
 
+// ValidateConfig validates configuration rules.
 func ValidateConfig(cfg Config) error {
 	validKinds := map[string]bool{
-		"const":           true,
-		"var":             true,
-		"type":            true,
-		"func":            true,
-		"receiver":        true,
-		"packageMainFunc": true,
-		"constructor":     true,
-		"unknown":         true,
+		"const":             true,
+		"var":               true,
+		"type":              true,
+		kindFunc:            true,
+		"receiver":          true,
+		kindPackageMainFunc: true,
+		"constructor":       true,
+		"unknown":           true,
 	}
 	for _, rule := range cfg.Order {
 		if !validKinds[rule.Kind] {
 			return fmt.Errorf("unknown kind in config: %s", rule.Kind)
 		}
 	}
+
 	return nil
 }
 
@@ -160,7 +199,9 @@ func classifyDecl(decl ast.Decl) (kind, name string, exported bool) {
 		}
 
 		name = genDeclPrimaryName(d)
+
 		exported = ast.IsExported(name)
+
 		return kind, name, exported
 	case *ast.FuncDecl:
 		name = d.Name.Name
@@ -171,7 +212,7 @@ func classifyDecl(decl ast.Decl) (kind, name string, exported bool) {
 		if strings.HasPrefix(name, "New") {
 			return "constructor", name, exported
 		}
-		return "func", name, exported
+		return kindFunc, name, exported
 	default:
 		return "unknown", "", false
 	}
@@ -181,6 +222,7 @@ func genDeclPrimaryName(d *ast.GenDecl) string {
 	if len(d.Specs) == 0 {
 		return ""
 	}
+
 	switch spec := d.Specs[0].(type) {
 	case *ast.ValueSpec:
 		if len(spec.Names) == 0 {
@@ -195,7 +237,17 @@ func genDeclPrimaryName(d *ast.GenDecl) string {
 }
 
 func helperAttachmentData(infos []declInfo) (map[string][]string, map[string]struct{}, map[string]int) {
+	helpers, callers := helperMaps(infos)
+	parentSets := buildParentSets(infos, helpers)
+	attached := buildAttached(parentSets, helpers, callers, infos)
+	children, attachedToRoot := buildHelperTree(attached, callers)
+
+	return children, attachedToRoot, helpers
+}
+
+func helperMaps(infos []declInfo) (map[string]int, map[string]int) {
 	helpers := map[string]int{}
+
 	callers := map[string]int{}
 	for i, info := range infos {
 		if info.IsHelper {
@@ -205,7 +257,10 @@ func helperAttachmentData(infos []declInfo) (map[string][]string, map[string]str
 			callers[info.Name] = i
 		}
 	}
+	return helpers, callers
+}
 
+func buildParentSets(infos []declInfo, helpers map[string]int) map[string]map[string]struct{} {
 	parentSets := map[string]map[string]struct{}{}
 	for _, info := range infos {
 		fn, ok := info.Decl.(*ast.FuncDecl)
@@ -216,6 +271,7 @@ func helperAttachmentData(infos []declInfo) (map[string][]string, map[string]str
 		if len(calls) == 0 {
 			continue
 		}
+
 		for _, callee := range calls {
 			if _, ok := helpers[callee]; !ok {
 				continue
@@ -228,43 +284,53 @@ func helperAttachmentData(infos []declInfo) (map[string][]string, map[string]str
 			set[info.Name] = struct{}{}
 		}
 	}
+	return parentSets
+}
 
+func buildAttached(parentSets map[string]map[string]struct{}, helpers, callers map[string]int, infos []declInfo) map[string]string {
 	attached := map[string]string{} // helper -> parent (direct)
 	for helper, parents := range parentSets {
 		if len(parents) != 1 {
 			continue
 		}
+
 		for parent := range parents {
 			helperIdx := helpers[helper]
 			parentIdx, ok := callers[parent]
 			if !ok {
 				continue
 			}
+
 			if infos[helperIdx].Key.OrderIndex != infos[parentIdx].Key.OrderIndex {
 				continue
 			}
+
 			attached[helper] = parent
 		}
 	}
+	return attached
+}
 
-	// Build helper tree rooted at the first non-helper ancestor.
+func buildHelperTree(attached map[string]string, callers map[string]int) (map[string][]string, map[string]struct{}) {
 	children := map[string][]string{} // parent -> helpers
+
 	attachedToRoot := map[string]struct{}{}
 	for helper := range attached {
-		root := resolveRootParent(helper, attached, helpers, infos, callers)
+		root := resolveRootParent(helper, attached, callers)
 		if root == "" {
 			continue
 		}
 		children[root] = append(children[root], helper)
 		attachedToRoot[helper] = struct{}{}
 	}
-	return children, attachedToRoot, helpers
+	return children, attachedToRoot
 }
 
 func collectCalls(body *ast.BlockStmt) []string {
 	if body == nil {
 		return nil
 	}
+
 	var calls []string
 	ast.Inspect(body, func(node ast.Node) bool {
 		call, ok := node.(*ast.CallExpr)
@@ -281,14 +347,16 @@ func collectCalls(body *ast.BlockStmt) []string {
 	return calls
 }
 
-func resolveRootParent(helper string, attached map[string]string, helpers map[string]int, infos []declInfo, callers map[string]int) string {
+func resolveRootParent(helper string, attached map[string]string, callers map[string]int) string {
 	seen := map[string]struct{}{}
+
 	cur := helper
 	for {
 		if _, ok := seen[cur]; ok {
 			return ""
 		}
 		seen[cur] = struct{}{}
+
 		parent, ok := attached[cur]
 		if !ok {
 			return ""
@@ -312,6 +380,7 @@ func renderFile(fset *token.FileSet, file *ast.File, imports []ast.Decl, infos [
 		Doc:     file.Doc,
 		Decls:   imports,
 	}
+
 	importFile.Comments = append([]*ast.CommentGroup{}, commentIndex.headerComments...)
 	importFile.Comments = append(importFile.Comments, commentIndex.importComments...)
 
@@ -324,6 +393,7 @@ func renderFile(fset *token.FileSet, file *ast.File, imports []ast.Decl, infos [
 		if out.Len() == 0 || out.Bytes()[out.Len()-1] != '\n' {
 			out.WriteByte('\n')
 		}
+
 		out.WriteByte('\n')
 	}
 
@@ -333,15 +403,18 @@ func renderFile(fset *token.FileSet, file *ast.File, imports []ast.Decl, infos [
 		if i == len(infos)-1 {
 			comments = append(comments, adjustCommentGroups(info.Decl.End(), commentIndex.trailing)...)
 		}
+
 		var buf bytes.Buffer
 		if err := pc.Fprint(&buf, fset, &printer.CommentedNode{Node: info.Decl, Comments: comments}); err != nil {
 			return nil, err
 		}
+
 		out.Write(buf.Bytes())
 		if i != len(infos)-1 {
 			if out.Len() == 0 || out.Bytes()[out.Len()-1] != '\n' {
 				out.WriteByte('\n')
 			}
+
 			out.WriteByte('\n')
 		}
 	}
@@ -370,19 +443,23 @@ func buildCommentIndex(fset *token.FileSet, file *ast.File, imports []ast.Decl, 
 		}
 		if cg.End() < file.Package {
 			idx.headerComments = append(idx.headerComments, cg)
+
 			continue
 		}
 		if decl := findContaining(importSpans, cg); decl != nil {
 			idx.importComments = append(idx.importComments, cg)
+
 			continue
 		}
 		if decl := findContaining(otherSpans, cg); decl != nil {
 			idx.inner[decl] = append(idx.inner[decl], cg)
+
 			continue
 		}
 		// Free comment: attach to next non-import decl if any.
 		if next := findNextDecl(otherSpans, cg); next != nil {
 			idx.leading[next] = append(idx.leading[next], cg)
+
 			continue
 		}
 		idx.trailing = append(idx.trailing, cg)
@@ -454,6 +531,7 @@ func adjustCommentGroups(base token.Pos, groups []*ast.CommentGroup) []*ast.Comm
 			nc.Slash = base
 			list[j] = &nc
 		}
+
 		out[i] = &ast.CommentGroup{List: list}
 	}
 	return out
@@ -530,12 +608,12 @@ func orderIndexFor(cfg Config, kind string, exported bool) int {
 		if rule.Kind != kind {
 			continue
 		}
-		if kind == "packageMainFunc" || rule.Exported == exported {
+		if kind == kindPackageMainFunc || rule.Exported == exported {
 			return i
 		}
 	}
-	if kind == "packageMainFunc" {
-		return orderIndexFor(cfg, "func", false)
+	if kind == kindPackageMainFunc {
+		return orderIndexFor(cfg, kindFunc, false)
 	}
 	return len(cfg.Order) + 1
 }

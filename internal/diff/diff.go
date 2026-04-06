@@ -39,12 +39,12 @@ import (
 // Second, the name is frequently interpreted as meaning that you have
 // to wait longer (to be patient) for the diff, meaning that it is a slower algorithm,
 // when in fact the algorithm is faster than the standard one.
-func Diff(oldName string, old []byte, newName string, new []byte) []byte {
-	if bytes.Equal(old, new) {
+func Diff(oldName string, old []byte, newName string, newSrc []byte) []byte {
+	if bytes.Equal(old, newSrc) {
 		return nil
 	}
 	x := lines(old)
-	y := lines(new)
+	y := lines(newSrc)
 
 	// Print diff header.
 	var out bytes.Buffer
@@ -189,22 +189,18 @@ func tgs(x, y []string) []pair {
 	// being positive and line numbers in y being negative.
 	// If a line is not unique, map stores 0 instead of a line number.
 	xm := make(map[string]int)
-	var xUnique []pair
 	for i, s := range x {
 		if m[s] == -1 {
 			xm[s] = i + 1
-			xUnique = append(xUnique, pair{x: i, y: i})
 		} else {
 			xm[s] = 0
 		}
 	}
 
 	ym := make(map[string]int)
-	var yUnique []pair
 	for i, s := range y {
 		if m[s] == -4 {
 			ym[s] = -(i + 1)
-			yUnique = append(yUnique, pair{x: i, y: i})
 		} else {
 			ym[s] = 0
 		}
@@ -241,7 +237,6 @@ func tgs(x, y []string) []pair {
 	// (If the real sequence is empty, the dummy is the only element.)
 	seq := []pair{{x: -1, y: -1}}
 	pred := make([]int, 1)
-	var b []int
 	for _, p := range pairs {
 		// Find length of longest seq ending at p.
 		// t is the length, i is the index of the last element.
@@ -256,7 +251,6 @@ func tgs(x, y []string) []pair {
 			seq[t] = p
 			pred[t] = i
 		}
-		b = append(b, t)
 	}
 
 	// Read backpointers to reconstruct the sequence.

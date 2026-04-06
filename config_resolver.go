@@ -1,3 +1,4 @@
+// Package main provides the gocan CLI.
 package main
 
 import (
@@ -52,6 +53,7 @@ type configResolver struct {
 
 func (r *configResolver) Resolve(filePath string) (format.Config, string, error) {
 	dir := filepath.Dir(filePath)
+
 	r.mu.Lock()
 	if cached, ok := r.cache[dir]; ok {
 		r.mu.Unlock()

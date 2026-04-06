@@ -63,6 +63,7 @@ func declKeysFromSrc(src []byte) ([]string, error) {
 		case *ast.FuncDecl:
 			if d.Recv == nil {
 				keys = append(keys, "func:"+d.Name.Name)
+
 				continue
 			}
 			recv := recvTypeName(d.Recv.List[0].Type)

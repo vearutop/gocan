@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -21,189 +22,86 @@ import (
 	"github.com/vearutop/gocan/internal/format"
 )
 
+type cliOptions struct {
+	writeFlag    bool
+	listFlag     bool
+	diffFlag     bool
+	checkFlag    bool
+	diffFile     string
+	parentCommit string
+	configPath   string
+	ghAnnotate   bool
+	ghHead       string
+	ghMessage    string
+	ghBase       string
+}
+
 func main() {
-	var (
-		writeFlag    bool
-		listFlag     bool
-		diffFlag     bool
-		checkFlag    bool
-		diffFile     string
-		parentCommit string
-		configPath   string
-		ghAnnotate   bool
-		ghHead       string
-		ghMessage    string
-		ghBase       string
-	)
-	flag.BoolVar(&writeFlag, "w", false, "write result to (source) file instead of stdout")
-	flag.BoolVar(&listFlag, "l", false, "list files whose formatting differs from gocan's")
-	flag.BoolVar(&diffFlag, "d", false, "display diffs instead of rewriting files")
-	flag.BoolVar(&checkFlag, "check", false, "exit non-zero if any file is not formatted")
-	flag.StringVar(&diffFile, "diff", "", "git diff file for changes (optional, used with -denoise)")
-	flag.StringVar(&parentCommit, "parent-commit", "", "git parent commit for diff base (optional, used with -denoise)")
-	flag.StringVar(&configPath, "config", "", "path to JSON config file")
-	flag.BoolVar(&ghAnnotate, "gh-annotate", false, "emit GitHub Actions annotations for layout-only changes")
-	flag.StringVar(&ghHead, "gh-head", "HEAD", "git head ref/sha for -gh-annotate")
-	flag.StringVar(&ghMessage, "gh-message", "Layout-only change (canonicalization)", "GitHub Actions annotation message")
-	flag.StringVar(&ghBase, "gh-base", "", "git base ref/sha for -gh-annotate (defaults to GITHUB_BASE_SHA if set)")
-	flag.Parse()
-
-	paths := flag.Args()
-	if len(paths) == 0 {
-		paths = []string{"-"}
-	}
-
-	if ghAnnotate {
-		if err := runGHAnnotate(ghBase, ghHead, ghMessage); err != nil {
-			fatal(err)
-		}
-		return
-	}
-
-	files, err := collectFiles(paths)
+	opts, paths := parseFlags()
+	changedAny, err := runMain(opts, paths)
 	if err != nil {
 		fatal(err)
 	}
+	if opts.checkFlag && changedAny {
+		os.Exit(1)
+	}
+}
+
+func parseFlags() (cliOptions, []string) {
+	var opts cliOptions
+	flag.BoolVar(&opts.writeFlag, "w", false, "write result to (source) file instead of stdout")
+	flag.BoolVar(&opts.listFlag, "l", false, "list files whose formatting differs from gocan's")
+	flag.BoolVar(&opts.diffFlag, "d", false, "display diffs instead of rewriting files")
+	flag.BoolVar(&opts.checkFlag, "check", false, "exit non-zero if any file is not formatted")
+	flag.StringVar(&opts.diffFile, "diff", "", "git diff file for changes (optional, used with -denoise)")
+	flag.StringVar(&opts.parentCommit, "parent-commit", "", "git parent commit for diff base (optional, used with -denoise)")
+	flag.StringVar(&opts.configPath, "config", "", "path to JSON config file")
+	flag.BoolVar(&opts.ghAnnotate, "gh-annotate", false, "emit GitHub Actions annotations for layout-only changes")
+	flag.StringVar(&opts.ghHead, "gh-head", "HEAD", "git head ref/sha for -gh-annotate")
+	flag.StringVar(&opts.ghMessage, "gh-message", "Layout-only change (canonicalization)", "GitHub Actions annotation message")
+	flag.StringVar(&opts.ghBase, "gh-base", "", "git base ref/sha for -gh-annotate (defaults to GITHUB_BASE_SHA if set)")
+	flag.Parse()
+	return opts, flag.Args()
+}
+
+func runMain(opts cliOptions, paths []string) (bool, error) {
+	if opts.ghAnnotate {
+		return false, runGHAnnotate(opts.ghBase, opts.ghHead, opts.ghMessage)
+	}
+	if len(paths) == 0 {
+		paths = []string{"-"}
+	}
+	files, err := collectFiles(paths)
+	if err != nil {
+		return false, err
+	}
 	if len(files) == 0 {
-		return
+		return false, nil
 	}
-
-	var (
-		cfg       format.Config
-		baseDir   string
-		cfgLoaded bool
-	)
-	if configPath != "" {
-		var err error
-		cfg, err = format.LoadConfig(configPath)
-		if err != nil {
-			fatal(err)
-		}
-		if err := format.ValidateConfig(cfg); err != nil {
-			fatal(err)
-		}
-		baseDir = filepath.Dir(configPath)
-		cfgLoaded = true
+	cfg, baseDir, cfgLoaded, err := loadConfig(opts.configPath)
+	if err != nil {
+		return false, err
 	}
-
 	resolver := newConfigResolver()
 	out := io.Writer(os.Stdout)
 	changedAny := false
 	for _, path := range files {
-		if path == "-" {
-			stdinCfg := cfg
-			if !cfgLoaded {
-				stdinCfg = format.DefaultConfig()
-				if err := format.ValidateConfig(stdinCfg); err != nil {
-					fatal(err)
-				}
-			}
-			src, err := io.ReadAll(os.Stdin)
-			if err != nil {
-				fatal(err)
-			}
-			formatted, err := format.FormatFile("stdin", src, stdinCfg)
-			if err != nil {
-				fatal(err)
-			}
-			changed := !bytesEqual(src, formatted)
-			if changed {
-				changedAny = true
-			}
-			if diffFlag && changed {
-				diff, err := unifiedDiff("stdin", src, formatted)
-				if err != nil {
-					fatal(err)
-				}
-				if _, err := out.Write(diff); err != nil {
-					fatal(err)
-				}
-			}
-			if listFlag && changed {
-				if _, err := fmt.Fprintln(out, "stdin"); err != nil {
-					fatal(err)
-				}
-			}
-			if !writeFlag && !listFlag && !diffFlag {
-				if _, err := out.Write(formatted); err != nil {
-					fatal(err)
-				}
-				if len(formatted) == 0 || formatted[len(formatted)-1] != '\n' {
-					if _, err := out.Write([]byte("\n")); err != nil {
-						fatal(err)
-					}
-				}
-			}
-			continue
-		}
-
-		if !cfgLoaded {
-			var err error
-			cfg, baseDir, err = resolver.Resolve(path)
-			if err != nil {
-				fatal(err)
-			}
-		}
-		if format.IsExcluded(path, baseDir, cfg) {
-			continue
-		}
-
-		src, err := os.ReadFile(path)
+		changed, err := processPath(path, opts, &cfg, &baseDir, &cfgLoaded, resolver, out)
 		if err != nil {
-			fatal(err)
+			return false, err
 		}
-		formatted, err := format.FormatFile(path, src, cfg)
-		if err != nil {
-			fatal(err)
-		}
-		changed := !bytesEqual(src, formatted)
 		if changed {
 			changedAny = true
 		}
-
-		if listFlag && changed {
-			if _, err := fmt.Fprintln(out, path); err != nil {
-				fatal(err)
-			}
-		}
-
-		if diffFlag && changed {
-			diff, err := unifiedDiff(path, src, formatted)
-			if err != nil {
-				fatal(err)
-			}
-			if _, err := out.Write(diff); err != nil {
-				fatal(err)
-			}
-		}
-
-		if writeFlag && changed {
-			if err := os.WriteFile(path, formatted, 0o644); err != nil {
-				fatal(err)
-			}
-		}
-
-		if !writeFlag && !listFlag && !diffFlag {
-			if _, err := out.Write(formatted); err != nil {
-				fatal(err)
-			}
-			if len(formatted) == 0 || formatted[len(formatted)-1] != '\n' {
-				if _, err := out.Write([]byte("\n")); err != nil {
-					fatal(err)
-				}
-			}
-		}
 	}
-
-	if checkFlag && changedAny {
-		os.Exit(1)
-	}
+	return changedAny, nil
 }
 
 func bytesEqual(a, b []byte) bool {
 	if len(a) != len(b) {
 		return false
 	}
+
 	for i := range a {
 		if a[i] != b[i] {
 			return false
@@ -212,11 +110,125 @@ func bytesEqual(a, b []byte) bool {
 	return true
 }
 
+func loadConfig(path string) (format.Config, string, bool, error) {
+	if path == "" {
+		return format.Config{}, "", false, nil
+	}
+	cfg, err := format.LoadConfig(path)
+	if err != nil {
+		return format.Config{}, "", false, err
+	}
+	if err := format.ValidateConfig(cfg); err != nil {
+		return format.Config{}, "", false, err
+	}
+	return cfg, filepath.Dir(path), true, nil
+}
+
+func processPath(path string, opts cliOptions, cfg *format.Config, baseDir *string, cfgLoaded *bool, resolver *configResolver, out io.Writer) (bool, error) {
+	if path == "-" {
+		return processStdin(opts, cfg, cfgLoaded, out)
+	}
+	return processFile(path, opts, cfg, baseDir, cfgLoaded, resolver, out)
+}
+
+func processStdin(opts cliOptions, cfg *format.Config, cfgLoaded *bool, out io.Writer) (bool, error) {
+	stdinCfg := *cfg
+	if !*cfgLoaded {
+		stdinCfg = format.DefaultConfig()
+		if err := format.ValidateConfig(stdinCfg); err != nil {
+			return false, err
+		}
+	}
+	src, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		return false, err
+	}
+	formatted, err := format.FormatFile("stdin", src, stdinCfg)
+	if err != nil {
+		return false, err
+	}
+	changed := !bytesEqual(src, formatted)
+	if opts.diffFlag && changed {
+		diff := unifiedDiff("stdin", src, formatted)
+		if _, err := out.Write(diff); err != nil {
+			return false, err
+		}
+	}
+	if opts.listFlag && changed {
+		if _, err := fmt.Fprintln(out, "stdin"); err != nil {
+			return false, err
+		}
+	}
+	if err := outputFormatted(opts, formatted, out); err != nil {
+		return false, err
+	}
+	return changed, nil
+}
+
+func processFile(path string, opts cliOptions, cfg *format.Config, baseDir *string, cfgLoaded *bool, resolver *configResolver, out io.Writer) (bool, error) {
+	if !*cfgLoaded {
+		var err error
+		*cfg, *baseDir, err = resolver.Resolve(path)
+		if err != nil {
+			return false, err
+		}
+	}
+	if format.IsExcluded(path, *baseDir, *cfg) {
+		return false, nil
+	}
+	src, err := os.ReadFile(path)
+	if err != nil {
+		return false, err
+	}
+	formatted, err := format.FormatFile(path, src, *cfg)
+	if err != nil {
+		return false, err
+	}
+	changed := !bytesEqual(src, formatted)
+	if opts.listFlag && changed {
+		if _, err := fmt.Fprintln(out, path); err != nil {
+			return false, err
+		}
+	}
+	if opts.diffFlag && changed {
+		diff := unifiedDiff(path, src, formatted)
+		if _, err := out.Write(diff); err != nil {
+			return false, err
+		}
+	}
+	if opts.writeFlag && changed {
+		// #nosec G306 G703 -- formatting output is not sensitive and path is from user input by design.
+		if err := os.WriteFile(path, formatted, 0o644); err != nil {
+			return false, err
+		}
+	}
+	if err := outputFormatted(opts, formatted, out); err != nil {
+		return false, err
+	}
+	return changed, nil
+}
+
+func outputFormatted(opts cliOptions, formatted []byte, out io.Writer) error {
+	if opts.writeFlag || opts.listFlag || opts.diffFlag {
+		return nil
+	}
+	if _, err := out.Write(formatted); err != nil {
+		return err
+	}
+	if len(formatted) == 0 || formatted[len(formatted)-1] != '\n' {
+		if _, err := out.Write([]byte("\n")); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func collectFiles(paths []string) ([]string, error) {
 	var files []string
 	for _, p := range paths {
 		if p == "-" {
 			files = append(files, p)
+
 			continue
 		}
 		p = format.CanonicalizePath(p)
@@ -225,29 +237,10 @@ func collectFiles(paths []string) ([]string, error) {
 			return nil, err
 		}
 		if info.IsDir() {
-			root := p
-			err := filepath.WalkDir(p, func(path string, d os.DirEntry, err error) error {
-				if err != nil {
-					return err
-				}
-				if d.IsDir() {
-					if path == root {
-						return nil
-					}
-					name := d.Name()
-					if name == "vendor" || strings.HasPrefix(name, ".") {
-						return filepath.SkipDir
-					}
-					return nil
-				}
-				if strings.HasSuffix(path, ".go") {
-					files = append(files, path)
-				}
-				return nil
-			})
-			if err != nil {
+			if err := appendDirFiles(p, &files); err != nil {
 				return nil, err
 			}
+
 			continue
 		}
 		if strings.HasSuffix(p, ".go") {
@@ -255,6 +248,28 @@ func collectFiles(paths []string) ([]string, error) {
 		}
 	}
 	return files, nil
+}
+
+func appendDirFiles(root string, files *[]string) error {
+	return filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			if path == root {
+				return nil
+			}
+			name := d.Name()
+			if name == "vendor" || strings.HasPrefix(name, ".") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if strings.HasSuffix(path, ".go") {
+			*files = append(*files, path)
+		}
+		return nil
+	})
 }
 
 func runGHAnnotate(baseRef, headRef, message string) error {
@@ -299,40 +314,56 @@ func runGHAnnotate(baseRef, headRef, message string) error {
 	)
 	for _, path := range files {
 		filesScanned++
-		headSrc := pkgCache.headSource(path)
-		if headSrc == nil {
-			debugf(debug, "skip %s: missing in head or excluded", path)
-			continue
-		}
-		rawRanges, _, err := gitDiffRanges(baseCommit, headRef, path)
+		fileResult, err := annotateFile(path, baseCommit, headRef, pkgCache, message, debug)
 		if err != nil {
 			return err
 		}
-		if len(rawRanges) == 0 {
-			debugf(debug, "skip %s: no raw hunks", path)
-			continue
+		if fileResult.hasChanges {
+			filesWithChanges++
 		}
-		filesWithChanges++
-
-		unchanged := pkgCache.unchangedDecls(path)
-		if len(unchanged) == 0 {
-			debugf(debug, "skip %s: no layout-only decls", path)
-			continue
-		}
-		annotations := declsOverlapping(unchanged, rawRanges)
-		if len(annotations) == 0 {
-			debugf(debug, "skip %s: no layout-only decls", path)
-			continue
-		}
-		filesAnnotated++
-		annotations = mergeRangesByContent(annotations, headSrc, 2)
-		for _, r := range annotations {
-			annotatedDecls++
-			emitNotice(path, r, message)
+		if fileResult.annotatedDecls > 0 {
+			filesAnnotated++
+			annotatedDecls += fileResult.annotatedDecls
 		}
 	}
 	debugf(debug, "summary: files_scanned=%d files_with_changes=%d files_annotated=%d annotated_decls=%d", filesScanned, filesWithChanges, filesAnnotated, annotatedDecls)
 	return nil
+}
+
+type annotationResult struct {
+	hasChanges     bool
+	annotatedDecls int
+}
+
+func annotateFile(path, baseCommit, headRef string, pkgCache *packageCache, message string, debug bool) (annotationResult, error) {
+	headSrc := pkgCache.headSource(path)
+	if headSrc == nil {
+		debugf(debug, "skip %s: missing in head or excluded", path)
+		return annotationResult{}, nil
+	}
+	rawRanges, _, err := gitDiffRanges(baseCommit, headRef, path)
+	if err != nil {
+		return annotationResult{}, err
+	}
+	if len(rawRanges) == 0 {
+		debugf(debug, "skip %s: no raw hunks", path)
+		return annotationResult{}, nil
+	}
+	unchanged := pkgCache.unchangedDecls(path)
+	if len(unchanged) == 0 {
+		debugf(debug, "skip %s: no layout-only decls", path)
+		return annotationResult{hasChanges: true}, nil
+	}
+	annotations := declsOverlapping(unchanged, rawRanges)
+	if len(annotations) == 0 {
+		debugf(debug, "skip %s: no layout-only decls", path)
+		return annotationResult{hasChanges: true}, nil
+	}
+	annotations = mergeRangesByContent(annotations, headSrc, 2)
+	for _, r := range annotations {
+		emitNotice(path, r, message)
+	}
+	return annotationResult{hasChanges: true, annotatedDecls: len(annotations)}, nil
 }
 
 func emitNotice(path string, r hunkRange, msg string) {
@@ -346,15 +377,8 @@ func emitNotice(path string, r hunkRange, msg string) {
 		fmt.Printf("::notice file=%s,line=%d::%s\n", path, r.Start, msg)
 		return
 	}
-	fmt.Printf("::notice file=%s,line=%d,endLine=%d::%s\n", path, r.Start, r.End, msg)
-}
 
-func diffRanges(name string, oldSrc, newSrc []byte) []hunkRange {
-	d := diff.Diff(name, oldSrc, name, newSrc)
-	if len(d) == 0 {
-		return nil
-	}
-	return parseUnifiedRanges(d)
+	fmt.Printf("::notice file=%s,line=%d,endLine=%d::%s\n", path, r.Start, r.End, msg)
 }
 
 func parseUnifiedRanges(unified []byte) []hunkRange {
@@ -390,12 +414,12 @@ func parseRange(part string) (start, count int, ok bool) {
 	if part == "" {
 		return 0, 0, false
 	}
-	if i := strings.IndexByte(part, ','); i >= 0 {
-		s, err := strconv.Atoi(part[:i])
+	if left, right, found := strings.Cut(part, ","); found {
+		s, err := strconv.Atoi(left)
 		if err != nil {
 			return 0, 0, false
 		}
-		c, err := strconv.Atoi(part[i+1:])
+		c, err := strconv.Atoi(right)
 		if err != nil {
 			return 0, 0, false
 		}
@@ -428,6 +452,7 @@ func mergeRangesByContent(ranges []hunkRange, src []byte, gap int) []hunkRange {
 			if r.End > last.End {
 				last.End = r.End
 			}
+
 			continue
 		}
 		merged = append(merged, r)
@@ -448,6 +473,7 @@ func changedGoFiles(baseRef, headRef string) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("git diff failed for base %q and head %q: %w", baseRef, headRef, err)
 	}
+
 	var files []string
 	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 		line = strings.TrimSpace(line)
@@ -461,11 +487,12 @@ func changedGoFiles(baseRef, headRef string) ([]string, error) {
 
 func gitShow(ref, path string) ([]byte, error) {
 	arg := fmt.Sprintf("%s:%s", ref, path)
-	return execCommand("git", "show", arg)
+	return execGitCommand("show", arg)
 }
 
-func execCommand(name string, args ...string) ([]byte, error) {
-	cmd := exec.Command(name, args...)
+func execGitCommand(args ...string) ([]byte, error) {
+	// #nosec G204 G702 -- git commands with controlled args.
+	cmd := exec.CommandContext(context.Background(), "git", args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		msg := strings.TrimSpace(string(out))
@@ -478,11 +505,13 @@ func execCommand(name string, args ...string) ([]byte, error) {
 }
 
 func execGitDiff(args ...string) ([]byte, error) {
-	cmd := exec.Command("git", args...)
+	// #nosec G204 G702 -- git commands with controlled args.
+	cmd := exec.CommandContext(context.Background(), "git", args...)
 	out, err := cmd.CombinedOutput()
 	if err == nil {
 		return out, nil
 	}
+
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
 		// Exit code 1 means "differences found".
@@ -496,7 +525,8 @@ func execGitDiff(args ...string) ([]byte, error) {
 }
 
 func requireGitWorktree() error {
-	out, err := exec.Command("git", "rev-parse", "--is-inside-work-tree").CombinedOutput()
+	// #nosec G204 G702 -- git command with controlled args.
+	out, err := exec.CommandContext(context.Background(), "git", "rev-parse", "--is-inside-work-tree").CombinedOutput()
 	if err == nil && strings.TrimSpace(string(out)) == "true" {
 		return nil
 	}
@@ -525,16 +555,16 @@ func resolveBaseRef(baseRef string, tried *[]string) (string, error) {
 			return c, nil
 		}
 	}
-	return "", fmt.Errorf("unable to resolve git base ref; provide -gh-base or set GITHUB_BASE_SHA")
+	return "", errors.New("unable to resolve git base ref; provide -gh-base or set GITHUB_BASE_SHA")
 }
 
 func refExists(ref string) bool {
-	_, err := execCommand("git", "rev-parse", "--verify", ref)
+	_, err := execGitCommand("rev-parse", "--verify", ref)
 	return err == nil
 }
 
 func mergeBase(baseRef, headRef string) (string, error) {
-	out, err := execCommand("git", "merge-base", baseRef, headRef)
+	out, err := execGitCommand("merge-base", baseRef, headRef)
 	if err != nil {
 		return "", fmt.Errorf("failed to resolve merge base for %q and %q: %w", baseRef, headRef, err)
 	}
@@ -550,6 +580,7 @@ func debugEnabled() bool {
 	if v == "" {
 		return false
 	}
+
 	switch strings.ToLower(v) {
 	case "0", "false", "no", "off":
 		return false
@@ -571,7 +602,7 @@ func bytesSplit(b []byte, sep byte) []string {
 	}
 	out := []string{}
 	start := 0
-	for i := 0; i < len(b); i++ {
+	for i := range b {
 		if b[i] == sep {
 			out = append(out, string(b[start:i]))
 			start = i + 1
@@ -581,14 +612,6 @@ func bytesSplit(b []byte, sep byte) []string {
 		out = append(out, string(b[start:]))
 	}
 	return out
-}
-
-func previewLines(b []byte, maxLines int) string {
-	lines := bytesSplit(b, '\n')
-	if len(lines) > maxLines {
-		lines = lines[:maxLines]
-	}
-	return strings.Join(lines, "\n")
 }
 
 func gapMergeable(lines []string, startLine, endLine int) bool {
@@ -611,6 +634,7 @@ func gapMergeable(lines []string, startLine, endLine int) bool {
 			if strings.Contains(line, "*/") {
 				inBlock = false
 			}
+
 			continue
 		}
 		if strings.HasPrefix(line, "//") {
@@ -620,6 +644,7 @@ func gapMergeable(lines []string, startLine, endLine int) bool {
 			if !strings.Contains(line, "*/") {
 				inBlock = true
 			}
+
 			continue
 		}
 		if strings.HasPrefix(line, "*") || strings.HasPrefix(line, "*/") {
@@ -662,9 +687,7 @@ func declSpans(src []byte) ([]declSpan, string, error) {
 		}
 		start := fset.Position(decl.Pos()).Line
 		end := fset.Position(decl.End()).Line
-		if end < start {
-			end = start
-		}
+		end = max(end, start)
 		spans = append(spans, declSpan{
 			Fingerprint: fp,
 			StartLine:   start,
@@ -711,6 +734,7 @@ func genDeclName(d *ast.GenDecl) string {
 	if len(d.Specs) == 0 {
 		return ""
 	}
+
 	switch s := d.Specs[0].(type) {
 	case *ast.TypeSpec:
 		return s.Name.Name
@@ -722,36 +746,13 @@ func genDeclName(d *ast.GenDecl) string {
 	return ""
 }
 
-func matchUnchangedDecls(base, head []declSpan) []declSpan {
-	baseMap := map[string][]declSpan{}
-	for _, d := range base {
-		baseMap[d.Fingerprint] = append(baseMap[d.Fingerprint], d)
-	}
-	headMap := map[string][]declSpan{}
-	for _, d := range head {
-		headMap[d.Fingerprint] = append(headMap[d.Fingerprint], d)
-	}
-	var unchanged []declSpan
-	for fp, headList := range headMap {
-		baseList := baseMap[fp]
-		n := len(headList)
-		if len(baseList) < n {
-			n = len(baseList)
-		}
-		if n == 0 {
-			continue
-		}
-		unchanged = append(unchanged, headList[:n]...)
-	}
-	return unchanged
-}
-
 func declsOverlapping(decls []declSpan, ranges []hunkRange) []hunkRange {
 	var out []hunkRange
 	for _, d := range decls {
 		for _, r := range ranges {
 			if d.StartLine <= r.End && r.Start <= d.EndLine {
 				out = append(out, hunkRange{Start: d.StartLine, End: d.EndLine})
+
 				break
 			}
 		}
@@ -789,7 +790,9 @@ func (c *packageCache) headSource(path string) []byte {
 			return ctx.headSrcByFile[path]
 		}
 	}
-	_ = c.ensureDir(filepath.Dir(path))
+	if err := c.ensureDir(filepath.Dir(path)); err != nil {
+		return nil
+	}
 	if key, ok := c.fileToKey[path]; ok {
 		if ctx, ok := c.contexts[key]; ok {
 			return ctx.headSrcByFile[path]
@@ -807,7 +810,9 @@ func (c *packageCache) unchangedDecls(path string) []declSpan {
 			return ctx.unchangedByFile[path]
 		}
 	}
-	_ = c.ensureDir(filepath.Dir(path))
+	if err := c.ensureDir(filepath.Dir(path)); err != nil {
+		return nil
+	}
 	if key, ok := c.fileToKey[path]; ok {
 		if ctx, ok := c.contexts[key]; ok {
 			if !ctx.unchangedComputed {
@@ -829,6 +834,17 @@ func (c *packageCache) ensureDir(dir string) error {
 		return err
 	}
 
+	if err := c.loadHeadFiles(dir, headFiles); err != nil {
+		return err
+	}
+	if err := c.loadBaseFiles(dir, baseFiles); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (c *packageCache) loadHeadFiles(dir string, headFiles []string) error {
 	for _, path := range headFiles {
 		if _, ok := c.fileToKey[path]; ok {
 			continue
@@ -852,22 +868,15 @@ func (c *packageCache) ensureDir(dir string) error {
 		if err != nil {
 			return err
 		}
-		key := packageKey(dir, pkg)
-		ctx := c.contexts[key]
-		if ctx == nil {
-			ctx = &packageContext{
-				baseCounts:      make(map[string]int),
-				headDeclsByFile: make(map[string][]declSpan),
-				headSrcByFile:   make(map[string][]byte),
-				unchangedByFile: make(map[string][]declSpan),
-			}
-			c.contexts[key] = ctx
-		}
-		c.fileToKey[path] = key
+		ctx := c.ensureContext(dir, pkg)
+		c.fileToKey[path] = packageKey(dir, pkg)
 		ctx.headDeclsByFile[path] = decls
 		ctx.headSrcByFile[path] = src
 	}
+	return nil
+}
 
+func (c *packageCache) loadBaseFiles(dir string, baseFiles []string) error {
 	for _, path := range baseFiles {
 		cfg, baseDir, err := c.resolver.Resolve(path)
 		if err != nil {
@@ -888,22 +897,27 @@ func (c *packageCache) ensureDir(dir string) error {
 		if err != nil {
 			return err
 		}
-		key := packageKey(dir, pkg)
-		ctx := c.contexts[key]
-		if ctx == nil {
-			ctx = &packageContext{
-				baseCounts:      make(map[string]int),
-				headDeclsByFile: make(map[string][]declSpan),
-				headSrcByFile:   make(map[string][]byte),
-				unchangedByFile: make(map[string][]declSpan),
-			}
-			c.contexts[key] = ctx
-		}
+		ctx := c.ensureContext(dir, pkg)
 		for _, d := range decls {
 			ctx.baseCounts[d.Fingerprint]++
 		}
 	}
 	return nil
+}
+
+func (c *packageCache) ensureContext(dir, pkg string) *packageContext {
+	key := packageKey(dir, pkg)
+	ctx := c.contexts[key]
+	if ctx == nil {
+		ctx = &packageContext{
+			baseCounts:      make(map[string]int),
+			headDeclsByFile: make(map[string][]declSpan),
+			headSrcByFile:   make(map[string][]byte),
+			unchangedByFile: make(map[string][]declSpan),
+		}
+		c.contexts[key] = ctx
+	}
+	return ctx
 }
 
 func (c *packageCache) computeUnchanged(ctx *packageContext) {
@@ -950,10 +964,11 @@ func listGoFilesInDir(dir string) ([]string, error) {
 }
 
 func listGoFilesInDirAtCommit(commit, dir string) ([]string, error) {
-	out, err := execCommand("git", "ls-tree", "-r", "--name-only", commit, "--", dir)
+	out, err := execGitCommand("ls-tree", "-r", "--name-only", commit, "--", dir)
 	if err != nil {
 		return nil, err
 	}
+
 	var files []string
 	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 		line = strings.TrimSpace(line)
@@ -977,11 +992,11 @@ func fatal(err error) {
 		fmt.Fprintf(os.Stderr, "gocan: %v\n", pathErr)
 		os.Exit(1)
 	}
+
 	fmt.Fprintf(os.Stderr, "gocan: %v\n", err)
 	os.Exit(1)
 }
 
-func unifiedDiff(path string, a, b []byte) ([]byte, error) {
-	out := diff.Diff(path, a, path, b)
-	return out, nil
+func unifiedDiff(path string, a, b []byte) []byte {
+	return diff.Diff(path, a, path, b)
 }
