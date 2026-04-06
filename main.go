@@ -197,6 +197,8 @@ func recvTypeName(expr ast.Expr) string {
 
 func runMain(opts cliOptions, paths []string) (bool, error) {
 	if opts.ghAnnotate {
+		setNoticeCollector(opts.ghMaxNotices, opts.ghSummary)
+		defer flushNotices()
 		return false, runGHAnnotate(opts.ghBase, opts.ghHead, opts.ghMessage)
 	}
 	if len(paths) == 0 {
@@ -661,6 +663,30 @@ func tryFetchBase(baseRef string) error {
 	return err
 }
 
+func ensureRefAvailable(ref, remote string) error {
+	if ref == "" || ref == "HEAD" {
+		return nil
+	}
+	if refExists(ref) {
+		return nil
+	}
+	if err := tryFetchRef(remote, ref); err != nil {
+		return fmt.Errorf("ref %q not present locally and fetch failed: %w", ref, err)
+	}
+	if !refExists(ref) {
+		return fmt.Errorf("ref %q not present locally; fetch %q %q", ref, remote, ref)
+	}
+	return nil
+}
+
+func tryFetchRef(remote, ref string) error {
+	if remote == "" {
+		remote = "origin"
+	}
+	_, err := execGitCommand("fetch", "--no-tags", "--depth=1", remote, ref)
+	return err
+}
+
 func mergeRangesByContent(ranges []hunkRange, src []byte, gap int) []hunkRange {
 	if len(ranges) <= 1 {
 		return ranges
@@ -772,6 +798,12 @@ func prepareAnnotate(baseRef, headRef, message string) (string, []string, []stri
 	debugf(debug, "gocan -gh-annotate base=%q head=%q message=%q", baseRef, headRef, message)
 	if len(tried) > 0 {
 		debugf(debug, "base ref candidates tried: %s", strings.Join(tried, ", "))
+	}
+	if err := ensureRefAvailable(baseRef, "origin"); err != nil {
+		return "", nil, nil, debug, err
+	}
+	if err := ensureRefAvailable(headRef, "origin"); err != nil {
+		return "", nil, nil, debug, err
 	}
 	baseCommit, err := mergeBase(baseRef, headRef)
 	if err != nil {
@@ -994,6 +1026,110 @@ func debugf(enabled bool, format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "gocan debug: "+format+"\n", args...)
 }
 
+type notice struct {
+	File string
+	Line int
+	End  int
+	Msg  string
+}
+
+type noticeCollector struct {
+	max     int
+	summary bool
+	notices []notice
+}
+
+var noticeSink *noticeCollector
+
+func setNoticeCollector(maxNotices int, summary bool) {
+	if maxNotices < 0 {
+		maxNotices = 0
+	}
+	noticeSink = &noticeCollector{
+		max:     maxNotices,
+		summary: summary,
+	}
+}
+
+func (c *noticeCollector) add(n notice) {
+	c.notices = append(c.notices, n)
+}
+
+func flushNotices() {
+	if noticeSink == nil {
+		return
+	}
+	n := noticeSink
+	limit := n.max
+	if limit > len(n.notices) || limit < 0 {
+		limit = len(n.notices)
+	}
+	for i := 0; i < limit; i++ {
+		printNotice(n.notices[i])
+	}
+	if n.summary {
+		if err := writeSummary(n.notices, len(n.notices)-limit); err != nil {
+			fmt.Fprintf(os.Stderr, "gocan: summary write failed: %v\n", err)
+		}
+	}
+	noticeSink = nil
+}
+
+func printNotice(n notice) {
+	if n.End <= 0 || n.End < n.Line {
+		n.End = n.Line
+	}
+	if n.End == n.Line {
+		fmt.Printf("::notice file=%s,line=%d::%s\n", n.File, n.Line, n.Msg)
+		return
+	}
+	fmt.Printf("::notice file=%s,line=%d,endLine=%d::%s\n", n.File, n.Line, n.End, n.Msg)
+}
+
+func writeSummary(notices []notice, suppressed int) error {
+	path := strings.TrimSpace(os.Getenv("GITHUB_STEP_SUMMARY"))
+	if path == "" {
+		return nil
+	}
+	var b strings.Builder
+	b.WriteString("### gocan layout-only annotations\n\n")
+	if len(notices) == 0 {
+		b.WriteString("No notices.\n")
+		return appendFile(path, b.String())
+	}
+	for _, n := range notices {
+		b.WriteString("- ")
+		b.WriteString(n.File)
+		if n.Line > 0 {
+			fmt.Fprintf(&b, ":%d", n.Line)
+			if n.End > n.Line {
+				fmt.Fprintf(&b, "-%d", n.End)
+			}
+		}
+		b.WriteString(" — ")
+		b.WriteString(n.Msg)
+		b.WriteString("\n")
+	}
+	if suppressed > 0 {
+		fmt.Fprintf(&b, "\n(%d additional notices suppressed in job log)\n", suppressed)
+	}
+	return appendFile(path, b.String())
+}
+
+func appendFile(path, content string) error {
+	// #nosec G302 G703 -- summary file is a workflow artifact.
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		//nolint:errcheck // best-effort close for summary file.
+		_ = f.Close()
+	}()
+	_, err = f.WriteString(content)
+	return err
+}
+
 func emitNotice(path string, r hunkRange, msg string) {
 	if r.Start <= 0 {
 		return
@@ -1001,12 +1137,17 @@ func emitNotice(path string, r hunkRange, msg string) {
 	if r.End < r.Start {
 		r.End = r.Start
 	}
-	if r.End == r.Start {
-		fmt.Printf("::notice file=%s,line=%d::%s\n", path, r.Start, msg)
+	n := notice{
+		File: path,
+		Line: r.Start,
+		End:  r.End,
+		Msg:  msg,
+	}
+	if noticeSink == nil {
+		printNotice(n)
 		return
 	}
-
-	fmt.Printf("::notice file=%s,line=%d,endLine=%d::%s\n", path, r.Start, r.End, msg)
+	noticeSink.add(n)
 }
 
 func execGitCommand(args ...string) ([]byte, error) {
@@ -1132,6 +1273,8 @@ func parseFlags() (cliOptions, []string) {
 	flag.StringVar(&opts.ghHead, "gh-head", "HEAD", "git head ref/sha for -gh-annotate")
 	flag.StringVar(&opts.ghMessage, "gh-message", "Layout-only change (canonicalization)", "GitHub Actions annotation message")
 	flag.StringVar(&opts.ghBase, "gh-base", "", "git base ref/sha for -gh-annotate (defaults to GITHUB_BASE_SHA if set)")
+	flag.IntVar(&opts.ghMaxNotices, "gh-max-notices", 10, "max GitHub Actions notices to emit")
+	flag.BoolVar(&opts.ghSummary, "gh-summary", true, "write full notice list to GITHUB_STEP_SUMMARY if available")
 	flag.Parse()
 	return opts, flag.Args()
 }
@@ -1157,6 +1300,8 @@ type cliOptions struct {
 	ghHead       string
 	ghMessage    string
 	ghBase       string
+	ghMaxNotices int
+	ghSummary    bool
 }
 
 type declOccurrence struct {
