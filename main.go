@@ -290,6 +290,7 @@ func runGHAnnotate(baseRef, headRef, message string) error {
 	}
 
 	resolver := newConfigResolver()
+	pkgCache := newPackageCache(baseCommit, resolver)
 	var (
 		filesScanned     int
 		filesWithChanges int
@@ -298,31 +299,11 @@ func runGHAnnotate(baseRef, headRef, message string) error {
 	)
 	for _, path := range files {
 		filesScanned++
-		headSrc, err := os.ReadFile(path)
-		if errors.Is(err, os.ErrNotExist) {
-			debugf(debug, "skip %s: missing in head", path)
+		headSrc := pkgCache.headSource(path)
+		if headSrc == nil {
+			debugf(debug, "skip %s: missing in head or excluded", path)
 			continue
 		}
-		if err != nil {
-			return err
-		}
-
-		cfg, baseDir, err := resolver.Resolve(path)
-		if err != nil {
-			return err
-		}
-		if format.IsExcluded(path, baseDir, cfg) {
-			debugf(debug, "skip %s: excluded", path)
-			continue
-		}
-
-		baseSrc, err := gitShow(baseCommit, path)
-		if err != nil {
-			// New file or missing in base: skip annotation.
-			debugf(debug, "skip %s: missing in base %q", path, baseCommit)
-			continue
-		}
-
 		rawRanges, _, err := gitDiffRanges(baseCommit, headRef, path)
 		if err != nil {
 			return err
@@ -333,24 +314,11 @@ func runGHAnnotate(baseRef, headRef, message string) error {
 		}
 		filesWithChanges++
 
-		baseNorm, err := format.FormatFile(path, baseSrc, cfg)
-		if err != nil {
-			return err
+		unchanged := pkgCache.unchangedDecls(path)
+		if len(unchanged) == 0 {
+			debugf(debug, "skip %s: no layout-only decls", path)
+			continue
 		}
-		headNorm, err := format.FormatFile(path, headSrc, cfg)
-		if err != nil {
-			return err
-		}
-
-		declsBase, err := declSpans(baseNorm)
-		if err != nil {
-			return err
-		}
-		declsHead, err := declSpans(headNorm)
-		if err != nil {
-			return err
-		}
-		unchanged := matchUnchangedDecls(declsBase, declsHead)
 		annotations := declsOverlapping(unchanged, rawRanges)
 		if len(annotations) == 0 {
 			debugf(debug, "skip %s: no layout-only decls", path)
@@ -676,11 +644,11 @@ type declSpan struct {
 	EndLine     int
 }
 
-func declSpans(src []byte) ([]declSpan, error) {
+func declSpans(src []byte) ([]declSpan, string, error) {
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, "file.go", src, 0)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	spans := make([]declSpan, 0, len(file.Decls))
 	for _, decl := range file.Decls {
@@ -690,7 +658,7 @@ func declSpans(src []byte) ([]declSpan, error) {
 		}
 		fp, err := declFingerprint(fset, decl)
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		start := fset.Position(decl.Pos()).Line
 		end := fset.Position(decl.End()).Line
@@ -703,7 +671,11 @@ func declSpans(src []byte) ([]declSpan, error) {
 			EndLine:     end,
 		})
 	}
-	return spans, nil
+	pkgName := ""
+	if file.Name != nil {
+		pkgName = file.Name.Name
+	}
+	return spans, pkgName, nil
 }
 
 func declFingerprint(fset *token.FileSet, decl ast.Decl) (string, error) {
@@ -785,6 +757,218 @@ func declsOverlapping(decls []declSpan, ranges []hunkRange) []hunkRange {
 		}
 	}
 	return out
+}
+
+type packageContext struct {
+	baseCounts        map[string]int
+	headDeclsByFile   map[string][]declSpan
+	headSrcByFile     map[string][]byte
+	unchangedByFile   map[string][]declSpan
+	unchangedComputed bool
+}
+
+type packageCache struct {
+	baseCommit string
+	resolver   *configResolver
+	contexts   map[string]*packageContext
+	fileToKey  map[string]string
+}
+
+func newPackageCache(baseCommit string, resolver *configResolver) *packageCache {
+	return &packageCache{
+		baseCommit: baseCommit,
+		resolver:   resolver,
+		contexts:   make(map[string]*packageContext),
+		fileToKey:  make(map[string]string),
+	}
+}
+
+func (c *packageCache) headSource(path string) []byte {
+	if key, ok := c.fileToKey[path]; ok {
+		if ctx, ok := c.contexts[key]; ok {
+			return ctx.headSrcByFile[path]
+		}
+	}
+	_ = c.ensureDir(filepath.Dir(path))
+	if key, ok := c.fileToKey[path]; ok {
+		if ctx, ok := c.contexts[key]; ok {
+			return ctx.headSrcByFile[path]
+		}
+	}
+	return nil
+}
+
+func (c *packageCache) unchangedDecls(path string) []declSpan {
+	if key, ok := c.fileToKey[path]; ok {
+		if ctx, ok := c.contexts[key]; ok {
+			if !ctx.unchangedComputed {
+				c.computeUnchanged(ctx)
+			}
+			return ctx.unchangedByFile[path]
+		}
+	}
+	_ = c.ensureDir(filepath.Dir(path))
+	if key, ok := c.fileToKey[path]; ok {
+		if ctx, ok := c.contexts[key]; ok {
+			if !ctx.unchangedComputed {
+				c.computeUnchanged(ctx)
+			}
+			return ctx.unchangedByFile[path]
+		}
+	}
+	return nil
+}
+
+func (c *packageCache) ensureDir(dir string) error {
+	headFiles, err := listGoFilesInDir(dir)
+	if err != nil {
+		return err
+	}
+	baseFiles, err := listGoFilesInDirAtCommit(c.baseCommit, dir)
+	if err != nil {
+		return err
+	}
+
+	for _, path := range headFiles {
+		if _, ok := c.fileToKey[path]; ok {
+			continue
+		}
+		cfg, baseDir, err := c.resolver.Resolve(path)
+		if err != nil {
+			return err
+		}
+		if format.IsExcluded(path, baseDir, cfg) {
+			continue
+		}
+		src, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		norm, err := format.FormatFile(path, src, cfg)
+		if err != nil {
+			return err
+		}
+		decls, pkg, err := declSpans(norm)
+		if err != nil {
+			return err
+		}
+		key := packageKey(dir, pkg)
+		ctx := c.contexts[key]
+		if ctx == nil {
+			ctx = &packageContext{
+				baseCounts:      make(map[string]int),
+				headDeclsByFile: make(map[string][]declSpan),
+				headSrcByFile:   make(map[string][]byte),
+				unchangedByFile: make(map[string][]declSpan),
+			}
+			c.contexts[key] = ctx
+		}
+		c.fileToKey[path] = key
+		ctx.headDeclsByFile[path] = decls
+		ctx.headSrcByFile[path] = src
+	}
+
+	for _, path := range baseFiles {
+		cfg, baseDir, err := c.resolver.Resolve(path)
+		if err != nil {
+			return err
+		}
+		if format.IsExcluded(path, baseDir, cfg) {
+			continue
+		}
+		src, err := gitShow(c.baseCommit, path)
+		if err != nil {
+			continue
+		}
+		norm, err := format.FormatFile(path, src, cfg)
+		if err != nil {
+			return err
+		}
+		decls, pkg, err := declSpans(norm)
+		if err != nil {
+			return err
+		}
+		key := packageKey(dir, pkg)
+		ctx := c.contexts[key]
+		if ctx == nil {
+			ctx = &packageContext{
+				baseCounts:      make(map[string]int),
+				headDeclsByFile: make(map[string][]declSpan),
+				headSrcByFile:   make(map[string][]byte),
+				unchangedByFile: make(map[string][]declSpan),
+			}
+			c.contexts[key] = ctx
+		}
+		for _, d := range decls {
+			ctx.baseCounts[d.Fingerprint]++
+		}
+	}
+	return nil
+}
+
+func (c *packageCache) computeUnchanged(ctx *packageContext) {
+	counts := make(map[string]int, len(ctx.baseCounts))
+	for k, v := range ctx.baseCounts {
+		counts[k] = v
+	}
+	files := make([]string, 0, len(ctx.headDeclsByFile))
+	for f := range ctx.headDeclsByFile {
+		files = append(files, f)
+	}
+	sort.Strings(files)
+	for _, f := range files {
+		for _, d := range ctx.headDeclsByFile[f] {
+			if counts[d.Fingerprint] > 0 {
+				ctx.unchangedByFile[f] = append(ctx.unchangedByFile[f], d)
+				counts[d.Fingerprint]--
+			}
+		}
+	}
+	ctx.unchangedComputed = true
+}
+
+func packageKey(dir, pkg string) string {
+	return dir + "||" + pkg
+}
+
+func listGoFilesInDir(dir string) ([]string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	var files []string
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if strings.HasSuffix(name, ".go") {
+			files = append(files, filepath.Join(dir, name))
+		}
+	}
+	return files, nil
+}
+
+func listGoFilesInDirAtCommit(commit, dir string) ([]string, error) {
+	out, err := execCommand("git", "ls-tree", "-r", "--name-only", commit, "--", dir)
+	if err != nil {
+		return nil, err
+	}
+	var files []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if !strings.HasSuffix(line, ".go") {
+			continue
+		}
+		if filepath.Dir(line) != dir {
+			continue
+		}
+		files = append(files, line)
+	}
+	return files, nil
 }
 
 func fatal(err error) {

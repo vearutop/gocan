@@ -127,10 +127,11 @@ Example workflow step:
 ```
 
 Notes:
-- `-gh-annotate` ignores new files that don't exist in the base ref.
+- New files are ignored unless they contain declarations that existed in base (i.e., moved between files within the same package directory), in which case those moved declarations can be annotated.
 - If `-gh-base` is not provided, `gocan` uses `GITHUB_BASE_SHA` if set, otherwise tries `origin/main`, `origin/master`, `main`, `master` (in that order).
 - Set `GOCAN_DEBUG=1` to print debug logs and a final summary to stderr.
 - In mixed files (layout-only moves plus semantic edits), annotations target only unchanged declarations whose text matches base after canonicalization.
+- Layout-only detection is package-scoped within a directory: declarations moved between files in the same directory/package can be annotated.
 
 ## Notes and Limitations
 
