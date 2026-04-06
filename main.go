@@ -605,13 +605,60 @@ func loadConfig(path string) (format.Config, string, bool, error) {
 func mergeBase(baseRef, headRef string) (string, error) {
 	out, err := execGitCommand("merge-base", baseRef, headRef)
 	if err != nil {
-		return "", fmt.Errorf("failed to resolve merge base for %q and %q: %w", baseRef, headRef, err)
+		return mergeBaseFallback(err, baseRef, headRef)
 	}
 	mb := strings.TrimSpace(string(out))
 	if mb == "" {
 		return "", fmt.Errorf("merge base for %q and %q is empty", baseRef, headRef)
 	}
 	return mb, nil
+}
+
+func mergeBaseFallback(cmdErr error, baseRef, headRef string) (string, error) {
+	baseOK := refExists(baseRef)
+	headOK := refExists(headRef)
+	if !baseOK {
+		return missingBaseFallback(cmdErr, baseRef, headRef)
+	}
+	if !headOK {
+		return "", fmt.Errorf("failed to resolve merge base for %q and %q: head ref not present locally: %w", baseRef, headRef, cmdErr)
+	}
+	// Fallback: if merge-base fails but base exists, use base directly.
+	return baseRef, nil
+}
+
+func missingBaseFallback(cmdErr error, baseRef, headRef string) (string, error) {
+	if err := tryFetchBase(baseRef); err != nil {
+		return "", fmt.Errorf("failed to resolve merge base for %q and %q: base ref not present locally; fetch the base sha (e.g. `git fetch --no-tags --depth=1 origin %s`): %w", baseRef, headRef, baseRef, cmdErr)
+	}
+	if !refExists(baseRef) {
+		return "", fmt.Errorf("failed to resolve merge base for %q and %q: base ref not present locally; fetch the base sha (e.g. `git fetch --no-tags --depth=1 origin %s`): %w", baseRef, headRef, baseRef, cmdErr)
+	}
+	if mb, ok := tryMergeBase(baseRef, headRef); ok {
+		return mb, nil
+	}
+	return "", fmt.Errorf("failed to resolve merge base for %q and %q: base ref present but merge-base failed: %w", baseRef, headRef, cmdErr)
+}
+
+func tryMergeBase(baseRef, headRef string) (string, bool) {
+	out, err := execGitCommand("merge-base", baseRef, headRef)
+	if err != nil {
+		return "", false
+	}
+	mb := strings.TrimSpace(string(out))
+	if mb == "" {
+		return "", false
+	}
+	return mb, true
+}
+
+func tryFetchBase(baseRef string) error {
+	// Best-effort fetch of base ref/sha for shallow checkouts.
+	if baseRef == "" || baseRef == "HEAD" {
+		return nil
+	}
+	_, err := execGitCommand("fetch", "--no-tags", "--depth=1", "origin", baseRef)
+	return err
 }
 
 func mergeRangesByContent(ranges []hunkRange, src []byte, gap int) []hunkRange {
