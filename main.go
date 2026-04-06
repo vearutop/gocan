@@ -276,34 +276,14 @@ func runGHAnnotate(baseRef, headRef, message string) error {
 	if err := requireGitWorktree(); err != nil {
 		return err
 	}
-	var tried []string
-	resolvedBase, err := resolveBaseRef(baseRef, &tried)
+	baseCommit, files, moveFiles, debug, err := prepareAnnotate(baseRef, headRef, message)
 	if err != nil {
-		return err
-	}
-	baseRef = resolvedBase
-	debug := debugEnabled()
-	debugf(debug, "gocan -gh-annotate base=%q head=%q message=%q", baseRef, headRef, message)
-	if len(tried) > 0 {
-		debugf(debug, "base ref candidates tried: %s", strings.Join(tried, ", "))
-	}
-	baseCommit, err := mergeBase(baseRef, headRef)
-	if err != nil {
-		return err
-	}
-	debugf(debug, "merge base: %s", baseCommit)
-	files, err := changedGoFiles(baseCommit, headRef)
-	if err != nil {
-		if len(tried) > 0 {
-			return fmt.Errorf("git diff failed for base %q and head %q: %w (tried: %s)", baseRef, headRef, err, strings.Join(tried, ", "))
-		}
 		return err
 	}
 	if len(files) == 0 {
 		debugf(debug, "no changed .go files")
 		return nil
 	}
-
 	resolver := newConfigResolver()
 	pkgCache := newPackageCache(baseCommit, resolver)
 	var (
@@ -326,8 +306,46 @@ func runGHAnnotate(baseRef, headRef, message string) error {
 			annotatedDecls += fileResult.annotatedDecls
 		}
 	}
+	if err := annotateMoves(moveFiles, baseCommit, resolver, debug); err != nil {
+		return err
+	}
 	debugf(debug, "summary: files_scanned=%d files_with_changes=%d files_annotated=%d annotated_decls=%d", filesScanned, filesWithChanges, filesAnnotated, annotatedDecls)
 	return nil
+}
+
+func prepareAnnotate(baseRef, headRef, message string) (string, []string, []string, bool, error) {
+	var tried []string
+	resolvedBase, err := resolveBaseRef(baseRef, &tried)
+	if err != nil {
+		return "", nil, nil, false, err
+	}
+	baseRef = resolvedBase
+	debug := debugEnabled()
+	debugf(debug, "gocan -gh-annotate base=%q head=%q message=%q", baseRef, headRef, message)
+	if len(tried) > 0 {
+		debugf(debug, "base ref candidates tried: %s", strings.Join(tried, ", "))
+	}
+	baseCommit, err := mergeBase(baseRef, headRef)
+	if err != nil {
+		return "", nil, nil, debug, err
+	}
+	debugf(debug, "merge base: %s", baseCommit)
+	files, err := changedGoFiles(baseCommit, headRef)
+	if err != nil {
+		if len(tried) > 0 {
+			return "", nil, nil, debug, fmt.Errorf("git diff failed for base %q and head %q: %w (tried: %s)", baseRef, headRef, err, strings.Join(tried, ", "))
+		}
+		return "", nil, nil, debug, err
+	}
+	moveFiles, err := moveFileList(baseCommit, headRef)
+	if err != nil {
+		return "", nil, nil, debug, err
+	}
+	return baseCommit, files, moveFiles, debug, nil
+}
+
+func moveFileList(baseCommit, headRef string) ([]string, error) {
+	return changedGoFilesWithRenames(baseCommit, headRef)
 }
 
 type annotationResult struct {
@@ -481,6 +499,57 @@ func changedGoFiles(baseRef, headRef string) ([]string, error) {
 			continue
 		}
 		files = append(files, format.CanonicalizePath(line))
+	}
+	return files, nil
+}
+
+func changedGoFilesWithRenames(baseRef, headRef string) ([]string, error) {
+	args := []string{
+		"diff",
+		"--name-status",
+		"--diff-filter=ACMRD",
+		fmt.Sprintf("%s..%s", baseRef, headRef),
+		"--",
+		"*.go",
+	}
+	out, err := execGitDiff(args...)
+	if err != nil {
+		return nil, fmt.Errorf("git diff failed for base %q and head %q: %w", baseRef, headRef, err)
+	}
+	seen := map[string]struct{}{}
+	var files []string
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.Split(line, "\t")
+		if len(parts) < 2 {
+			continue
+		}
+		status := parts[0]
+		addPath := func(p string) {
+			p = strings.TrimSpace(p)
+			if p == "" || !strings.HasSuffix(p, ".go") {
+				return
+			}
+			p = format.CanonicalizePath(p)
+			if _, ok := seen[p]; ok {
+				return
+			}
+			seen[p] = struct{}{}
+			files = append(files, p)
+		}
+		switch status[0] {
+		case 'R', 'C':
+			if len(parts) >= 3 {
+				addPath(parts[1])
+				addPath(parts[2])
+			}
+		default:
+			addPath(parts[1])
+		}
 	}
 	return files, nil
 }
@@ -665,6 +734,9 @@ func gitDiffRanges(baseRef, headRef, path string) ([]hunkRange, []byte, error) {
 
 type declSpan struct {
 	Fingerprint string
+	Kind        string
+	Name        string
+	DisplayName string
 	StartLine   int
 	EndLine     int
 }
@@ -685,11 +757,16 @@ func declSpans(src []byte) ([]declSpan, string, error) {
 		if err != nil {
 			return nil, "", err
 		}
+		kind, name := declKindName(decl)
+		display := declDisplayName(decl, kind, name)
 		start := fset.Position(decl.Pos()).Line
 		end := fset.Position(decl.End()).Line
 		end = max(end, start)
 		spans = append(spans, declSpan{
 			Fingerprint: fp,
+			Kind:        kind,
+			Name:        name,
+			DisplayName: display,
 			StartLine:   start,
 			EndLine:     end,
 		})
@@ -728,6 +805,86 @@ func declKindName(decl ast.Decl) (string, string) {
 	default:
 		return "decl", ""
 	}
+}
+
+func declDisplayName(decl ast.Decl, kind, name string) string {
+	if fn, ok := decl.(*ast.FuncDecl); ok && fn.Recv != nil && len(fn.Recv.List) > 0 {
+		recv := recvTypeName(fn.Recv.List[0].Type)
+		if recv != "" {
+			return recv + "." + name
+		}
+	}
+	if gen, ok := decl.(*ast.GenDecl); ok {
+		return genDeclDisplayName(gen, name)
+	}
+	if kind == "" {
+		return name
+	}
+	return name
+}
+
+func recvTypeName(expr ast.Expr) string {
+	switch v := expr.(type) {
+	case *ast.Ident:
+		return v.Name
+	case *ast.StarExpr:
+		if id, ok := v.X.(*ast.Ident); ok {
+			return id.Name
+		}
+	}
+	return ""
+}
+
+func genDeclDisplayName(gen *ast.GenDecl, firstName string) string {
+	if gen == nil {
+		return firstName
+	}
+	kind := strings.ToLower(gen.Tok.String())
+	isBlock := len(gen.Specs) > 1
+	if !isBlock {
+		if vs, ok := gen.Specs[0].(*ast.ValueSpec); ok && len(vs.Names) > 1 {
+			isBlock = true
+		}
+	}
+	names := genDeclNames(gen)
+	if firstName == "" && len(names) > 0 {
+		firstName = names[0]
+	}
+	if firstName == "" {
+		if isBlock {
+			return kind + " block"
+		}
+		return kind
+	}
+	if isBlock {
+		return kind + " " + formatNameList(names, firstName) + " (block)"
+	}
+	return kind + " " + firstName
+}
+
+func genDeclNames(gen *ast.GenDecl) []string {
+	var names []string
+	for _, spec := range gen.Specs {
+		switch s := spec.(type) {
+		case *ast.TypeSpec:
+			names = append(names, s.Name.Name)
+		case *ast.ValueSpec:
+			for _, n := range s.Names {
+				names = append(names, n.Name)
+			}
+		}
+	}
+	return names
+}
+
+func formatNameList(names []string, fallback string) string {
+	if len(names) == 0 {
+		return fallback
+	}
+	if len(names) == 1 {
+		return names[0]
+	}
+	return names[0] + ", ..."
 }
 
 func genDeclName(d *ast.GenDecl) string {
@@ -984,6 +1141,153 @@ func listGoFilesInDirAtCommit(commit, dir string) ([]string, error) {
 		files = append(files, line)
 	}
 	return files, nil
+}
+
+type declOccurrence struct {
+	declSpan
+	File   string
+	Pkg    string
+	PkgKey string
+}
+
+func annotateMoves(files []string, baseCommit string, resolver *configResolver, debug bool) error {
+	baseMap := map[string][]declOccurrence{}
+	headMap := map[string][]declOccurrence{}
+	for _, path := range files {
+		cfg, baseDir, err := resolver.Resolve(path)
+		if err != nil {
+			return err
+		}
+		if format.IsExcluded(path, baseDir, cfg) {
+			continue
+		}
+		if src, err := os.ReadFile(path); err == nil {
+			occ, err := buildOccurrences(path, src, cfg)
+			if err != nil {
+				return err
+			}
+			for _, o := range occ {
+				headMap[o.Fingerprint] = append(headMap[o.Fingerprint], o)
+			}
+		}
+		baseSrc, err := gitShow(baseCommit, path)
+		if err != nil {
+			continue
+		}
+		occ, err := buildOccurrences(path, baseSrc, cfg)
+		if err != nil {
+			return err
+		}
+		for _, o := range occ {
+			baseMap[o.Fingerprint] = append(baseMap[o.Fingerprint], o)
+		}
+	}
+
+	for fp, headList := range headMap {
+		baseList := baseMap[fp]
+		if err := annotateMovesForFingerprint(baseList, headList, debug); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func annotateMovesForFingerprint(baseList, headList []declOccurrence, debug bool) error {
+	added, removed := diffOccurrencesByPackage(baseList, headList)
+	if len(added) == 0 || len(removed) == 0 {
+		return nil
+	}
+	used := make([]bool, len(removed))
+	for _, add := range added {
+		candidates := candidateMoves(add, removed, used)
+		if len(candidates) != 1 {
+			if debug && len(candidates) > 1 {
+				debugf(debug, "skip move for %s: ambiguous (%d candidates)", add.File, len(candidates))
+			}
+			continue
+		}
+		idx := candidates[0]
+		used[idx] = true
+		src := removed[idx]
+		msg := fmt.Sprintf("Moved from %s (%s)", moveLabel(src), src.File)
+		emitNotice(add.File, hunkRange{Start: add.StartLine, End: add.EndLine}, msg)
+		backMsg := fmt.Sprintf("Moved to %s (%s)", moveLabel(add), add.File)
+		emitNotice(src.File, hunkRange{Start: src.StartLine, End: src.EndLine}, backMsg)
+	}
+	return nil
+}
+
+func buildOccurrences(path string, src []byte, cfg format.Config) ([]declOccurrence, error) {
+	norm, err := format.FormatFile(path, src, cfg)
+	if err != nil {
+		return nil, err
+	}
+	decls, pkg, err := declSpans(norm)
+	if err != nil {
+		return nil, err
+	}
+	pkgKey := packageKey(filepath.Dir(path), pkg)
+	occ := make([]declOccurrence, 0, len(decls))
+	for _, d := range decls {
+		occ = append(occ, declOccurrence{
+			declSpan: d,
+			File:     path,
+			Pkg:      pkg,
+			PkgKey:   pkgKey,
+		})
+	}
+	return occ, nil
+}
+
+func diffOccurrencesByPackage(base, head []declOccurrence) (added, removed []declOccurrence) {
+	baseByPkg := map[string][]declOccurrence{}
+	for _, b := range base {
+		baseByPkg[b.PkgKey] = append(baseByPkg[b.PkgKey], b)
+	}
+	headByPkg := map[string][]declOccurrence{}
+	for _, h := range head {
+		headByPkg[h.PkgKey] = append(headByPkg[h.PkgKey], h)
+	}
+	for pkgKey, baseList := range baseByPkg {
+		headList := headByPkg[pkgKey]
+		n := min(len(baseList), len(headList))
+		baseByPkg[pkgKey] = baseList[n:]
+		headByPkg[pkgKey] = headList[n:]
+	}
+	for _, list := range baseByPkg {
+		removed = append(removed, list...)
+	}
+	for _, list := range headByPkg {
+		added = append(added, list...)
+	}
+	return added, removed
+}
+
+func candidateMoves(add declOccurrence, removed []declOccurrence, used []bool) []int {
+	var out []int
+	for i, r := range removed {
+		if used[i] {
+			continue
+		}
+		if r.PkgKey == add.PkgKey {
+			continue
+		}
+		out = append(out, i)
+	}
+	return out
+}
+
+func moveLabel(src declOccurrence) string {
+	if src.Pkg != "" && src.DisplayName != "" {
+		return src.Pkg + "." + src.DisplayName
+	}
+	if src.Pkg != "" && src.Name != "" {
+		return src.Pkg + "." + src.Name
+	}
+	if src.DisplayName != "" {
+		return src.DisplayName
+	}
+	return src.Name
 }
 
 func fatal(err error) {

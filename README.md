@@ -1,11 +1,11 @@
 # gocan
 
-[![Build Status](https://github.com/bool64/go-template/workflows/test-unit/badge.svg)](https://github.com/bool64/go-template/actions?query=branch%3Amaster+workflow%3Atest-unit)
-[![Coverage Status](https://codecov.io/gh/bool64/go-template/branch/master/graph/badge.svg)](https://codecov.io/gh/bool64/go-template)
-[![GoDevDoc](https://img.shields.io/badge/dev-doc-00ADD8?logo=go)](https://pkg.go.dev/github.com/bool64/go-template)
-[![Time Tracker](https://wakatime.com/badge/github/bool64/go-template.svg)](https://wakatime.com/badge/github/bool64/go-template)
-![Code lines](https://sloc.xyz/github/bool64/go-template/?category=code)
-![Comments](https://sloc.xyz/github/bool64/go-template/?category=comments)
+[![Build Status](https://github.com/vearutop/gocan/workflows/test-unit/badge.svg)](https://github.com/vearutop/gocan/actions?query=branch%3Amaster+workflow%3Atest-unit)
+[![Coverage Status](https://codecov.io/gh/vearutop/gocan/branch/master/graph/badge.svg)](https://codecov.io/gh/vearutop/gocan)
+[![GoDevDoc](https://img.shields.io/badge/dev-doc-00ADD8?logo=go)](https://pkg.go.dev/github.com/vearutop/gocan)
+[![Time Tracker](https://wakatime.com/badge/github/vearutop/gocan.svg)](https://wakatime.com/badge/github/vearutop/gocan)
+![Code lines](https://sloc.xyz/github/vearutop/gocan/?category=code)
+![Comments](https://sloc.xyz/github/vearutop/gocan/?category=comments)
 
 `gocan` formats Go source files into a user-defined canonical declaration order to make diffs and merges cleaner. 
 It is intentionally gofmt-like: you can rewrite files, list files that would change, or show diffs.
@@ -132,6 +132,7 @@ Notes:
 - Set `GOCAN_DEBUG=1` to print debug logs and a final summary to stderr.
 - In mixed files (layout-only moves plus semantic edits), annotations target only unchanged declarations whose text matches base after canonicalization.
 - Layout-only detection is package-scoped within a directory: declarations moved between files in the same directory/package can be annotated.
+- `-gh-annotate` also tries to detect likely moves between packages in the PR by matching identical normalized declarations that disappear from one package and appear in another. Ambiguous matches are skipped.
 
 ## Notes and Limitations
 
