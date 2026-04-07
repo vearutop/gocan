@@ -11,9 +11,11 @@ import (
 	"go/parser"
 	"go/token"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -197,9 +199,9 @@ func recvTypeName(expr ast.Expr) string {
 
 func runMain(opts cliOptions, paths []string) (bool, error) {
 	if opts.ghAnnotate {
-		setNoticeCollector(opts.ghMaxNotices, opts.ghSummary)
+		setNoticeCollector(opts.ghMaxNotices, !opts.ghSkipSummary)
 		defer flushNotices()
-		return false, runGHAnnotate(opts.ghBase, opts.ghHead, opts.ghMessage)
+		return false, runGHAnnotate(opts.ghBase, opts.ghHead)
 	}
 	if len(paths) == 0 {
 		paths = []string{"-"}
@@ -230,7 +232,7 @@ func runMain(opts cliOptions, paths []string) (bool, error) {
 	return changedAny, nil
 }
 
-func annotateFile(path, baseCommit, headRef string, pkgCache *packageCache, message string, debug bool) (annotationResult, error) {
+func annotateFile(path, baseCommit, headRef string, pkgCache *packageCache, debug bool) (annotationResult, error) {
 	headSrc := pkgCache.headSource(path)
 	if headSrc == nil {
 		debugf(debug, "skip %s: missing in head or excluded", path)
@@ -254,9 +256,9 @@ func annotateFile(path, baseCommit, headRef string, pkgCache *packageCache, mess
 		debugf(debug, "skip %s: no layout-only decls", path)
 		return annotationResult{hasChanges: true}, nil
 	}
-	annotations = mergeRangesByContent(annotations, headSrc, 2)
-	for _, r := range annotations {
-		emitNotice(path, r, message)
+	_ = headSrc
+	for _, d := range annotations {
+		emitNoticeKind(path, hunkRange{Start: d.StartLine, End: d.EndLine}, "Layout-only change", noticeLayout, d.DisplayName)
 	}
 	return annotationResult{hasChanges: true, annotatedDecls: len(annotations)}, nil
 }
@@ -321,9 +323,9 @@ func annotateMovesForFingerprint(baseList, headList []declOccurrence, debug bool
 		used[idx] = true
 		src := removed[idx]
 		msg := fmt.Sprintf("Moved from %s (%s)", moveLabel(src), src.File)
-		emitNotice(add.File, hunkRange{Start: add.StartLine, End: add.EndLine}, msg)
+		emitNoticeKind(add.File, hunkRange{Start: add.StartLine, End: add.EndLine}, msg, noticeMovedFrom, add.DisplayName)
 		backMsg := fmt.Sprintf("Moved to %s (%s)", moveLabel(add), add.File)
-		emitNotice(src.File, hunkRange{Start: src.StartLine, End: src.EndLine}, backMsg)
+		emitNoticeKind(src.File, hunkRange{Start: src.StartLine, End: src.EndLine}, backMsg, noticeMovedTo, src.DisplayName)
 	}
 	return nil
 }
@@ -503,12 +505,12 @@ func debugEnabled() bool {
 	}
 }
 
-func declsOverlapping(decls []declSpan, ranges []hunkRange) []hunkRange {
-	var out []hunkRange
+func declsOverlapping(decls []declSpan, ranges []hunkRange) []declSpan {
+	var out []declSpan
 	for _, d := range decls {
 		for _, r := range ranges {
 			if d.StartLine <= r.End && r.Start <= d.EndLine {
-				out = append(out, hunkRange{Start: d.StartLine, End: d.EndLine})
+				out = append(out, d)
 
 				break
 			}
@@ -539,47 +541,6 @@ func diffOccurrencesByPackage(base, head []declOccurrence) (added, removed []dec
 		added = append(added, list...)
 	}
 	return added, removed
-}
-
-func gapMergeable(lines []string, startLine, endLine int) bool {
-	if startLine > endLine {
-		return true
-	}
-	if startLine < 1 {
-		startLine = 1
-	}
-	if endLine > len(lines) {
-		endLine = len(lines)
-	}
-	inBlock := false
-	for i := startLine; i <= endLine; i++ {
-		line := strings.TrimSpace(lines[i-1])
-		if line == "" {
-			continue
-		}
-		if inBlock {
-			if strings.Contains(line, "*/") {
-				inBlock = false
-			}
-
-			continue
-		}
-		if strings.HasPrefix(line, "//") {
-			continue
-		}
-		if strings.HasPrefix(line, "/*") {
-			if !strings.Contains(line, "*/") {
-				inBlock = true
-			}
-
-			continue
-		}
-		if strings.HasPrefix(line, "*") || strings.HasPrefix(line, "*/") {
-			continue
-		}
-		return false
-	}
-	return true
 }
 
 func gitDiffRanges(baseRef, headRef, path string) ([]hunkRange, []byte, error) {
@@ -656,7 +617,7 @@ func tryMergeBase(baseRef, headRef string) (string, bool) {
 
 func tryFetchBase(baseRef string) error {
 	// Best-effort fetch of base ref/sha for shallow checkouts.
-	if baseRef == "" || baseRef == "HEAD" {
+	if baseRef == "" || baseRef == headRefValue {
 		return nil
 	}
 	_, err := execGitCommand("fetch", "--no-tags", "--depth=1", "origin", baseRef)
@@ -664,7 +625,7 @@ func tryFetchBase(baseRef string) error {
 }
 
 func ensureRefAvailable(ref, remote string) error {
-	if ref == "" || ref == "HEAD" {
+	if ref == "" || ref == headRefValue {
 		return nil
 	}
 	if refExists(ref) {
@@ -685,29 +646,6 @@ func tryFetchRef(remote, ref string) error {
 	}
 	_, err := execGitCommand("fetch", "--no-tags", "--depth=1", remote, ref)
 	return err
-}
-
-func mergeRangesByContent(ranges []hunkRange, src []byte, gap int) []hunkRange {
-	if len(ranges) <= 1 {
-		return ranges
-	}
-	sort.Slice(ranges, func(i, j int) bool {
-		return ranges[i].Start < ranges[j].Start
-	})
-	merged := []hunkRange{ranges[0]}
-	lines := bytesSplit(src, '\n')
-	for _, r := range ranges[1:] {
-		last := &merged[len(merged)-1]
-		if r.Start <= last.End+gap && gapMergeable(lines, last.End+1, r.Start-1) {
-			if r.End > last.End {
-				last.End = r.End
-			}
-
-			continue
-		}
-		merged = append(merged, r)
-	}
-	return merged
 }
 
 func moveFileList(baseCommit, headRef string) ([]string, error) {
@@ -787,17 +725,26 @@ func parseUnifiedRanges(unified []byte) []hunkRange {
 	return ranges
 }
 
-func prepareAnnotate(baseRef, headRef, message string) (string, []string, []string, bool, error) {
-	var tried []string
-	resolvedBase, err := resolveBaseRef(baseRef, &tried)
+func prepareAnnotate(baseRef, headRef string) (string, []string, []string, bool, error) {
+	var triedBase []string
+	var triedHead []string
+	resolvedBase, err := resolveBaseRef(baseRef, &triedBase)
 	if err != nil {
 		return "", nil, nil, false, err
 	}
 	baseRef = resolvedBase
+	resolvedHead, err := resolveHeadRef(headRef, &triedHead)
+	if err != nil {
+		return "", nil, nil, false, err
+	}
+	headRef = resolvedHead
 	debug := debugEnabled()
-	debugf(debug, "gocan -gh-annotate base=%q head=%q message=%q", baseRef, headRef, message)
-	if len(tried) > 0 {
-		debugf(debug, "base ref candidates tried: %s", strings.Join(tried, ", "))
+	debugf(debug, "gocan -gh-annotate base=%q head=%q", baseRef, headRef)
+	if len(triedBase) > 0 {
+		debugf(debug, "base ref candidates tried: %s", strings.Join(triedBase, ", "))
+	}
+	if len(triedHead) > 0 {
+		debugf(debug, "head ref candidates tried: %s", strings.Join(triedHead, ", "))
 	}
 	if err := ensureRefAvailable(baseRef, "origin"); err != nil {
 		return "", nil, nil, debug, err
@@ -812,8 +759,8 @@ func prepareAnnotate(baseRef, headRef, message string) (string, []string, []stri
 	debugf(debug, "merge base: %s", baseCommit)
 	files, err := changedGoFiles(baseCommit, headRef)
 	if err != nil {
-		if len(tried) > 0 {
-			return "", nil, nil, debug, fmt.Errorf("git diff failed for base %q and head %q: %w (tried: %s)", baseRef, headRef, err, strings.Join(tried, ", "))
+		if len(triedBase) > 0 {
+			return "", nil, nil, debug, fmt.Errorf("git diff failed for base %q and head %q: %w (tried: %s)", baseRef, headRef, err, strings.Join(triedBase, ", "))
 		}
 		return "", nil, nil, debug, err
 	}
@@ -850,8 +797,8 @@ func processFile(path string, opts cliOptions, cfg *format.Config, baseDir *stri
 		}
 	}
 	if opts.diffFlag && changed {
-		diff := unifiedDiff(path, src, formatted)
-		if _, err := out.Write(diff); err != nil {
+		df := unifiedDiff(path, src, formatted)
+		if _, err := out.Write(df); err != nil {
 			return false, err
 		}
 	}
@@ -892,8 +839,8 @@ func processStdin(opts cliOptions, cfg *format.Config, cfgLoaded *bool, out io.W
 	}
 	changed := !bytesEqual(src, formatted)
 	if opts.diffFlag && changed {
-		diff := unifiedDiff("stdin", src, formatted)
-		if _, err := out.Write(diff); err != nil {
+		df := unifiedDiff("stdin", src, formatted)
+		if _, err := out.Write(df); err != nil {
 			return false, err
 		}
 	}
@@ -933,9 +880,11 @@ func resolveBaseRef(baseRef string, tried *[]string) (string, error) {
 	}
 	if env := strings.TrimSpace(os.Getenv("GITHUB_BASE_SHA")); env != "" {
 		*tried = append(*tried, "GITHUB_BASE_SHA="+env)
-		if refExists(env) {
-			return env, nil
-		}
+		return env, nil
+	}
+	if env := strings.TrimSpace(os.Getenv("GITHUB_BASE_REF")); env != "" {
+		*tried = append(*tried, "GITHUB_BASE_REF="+env)
+		return "origin/" + env, nil
 	}
 	candidates := []string{"origin/main", "origin/master", "main", "master"}
 	for _, c := range candidates {
@@ -944,14 +893,34 @@ func resolveBaseRef(baseRef string, tried *[]string) (string, error) {
 			return c, nil
 		}
 	}
-	return "", errors.New("unable to resolve git base ref; provide -gh-base or set GITHUB_BASE_SHA")
+	return "", errors.New("unable to resolve git base ref; provide -gh-base or set GITHUB_BASE_SHA/GITHUB_BASE_REF")
 }
 
-func runGHAnnotate(baseRef, headRef, message string) error {
+func resolveHeadRef(headRef string, tried *[]string) (string, error) {
+	headRef = strings.TrimSpace(headRef)
+	if headRef != "" {
+		return headRef, nil
+	}
+	if env := strings.TrimSpace(os.Getenv("GITHUB_HEAD_SHA")); env != "" {
+		*tried = append(*tried, "GITHUB_HEAD_SHA="+env)
+		return env, nil
+	}
+	if env := strings.TrimSpace(os.Getenv("GITHUB_HEAD_REF")); env != "" {
+		*tried = append(*tried, "GITHUB_HEAD_REF="+env)
+		return "origin/" + env, nil
+	}
+	*tried = append(*tried, headRefValue)
+	if refExists(headRefValue) {
+		return headRefValue, nil
+	}
+	return "", errors.New("unable to resolve git head ref; provide -gh-head or set GITHUB_HEAD_SHA/GITHUB_HEAD_REF")
+}
+
+func runGHAnnotate(baseRef, headRef string) error {
 	if err := requireGitWorktree(); err != nil {
 		return err
 	}
-	baseCommit, files, moveFiles, debug, err := prepareAnnotate(baseRef, headRef, message)
+	baseCommit, files, moveFiles, debug, err := prepareAnnotate(baseRef, headRef)
 	if err != nil {
 		return err
 	}
@@ -969,7 +938,7 @@ func runGHAnnotate(baseRef, headRef, message string) error {
 	)
 	for _, path := range files {
 		filesScanned++
-		fileResult, err := annotateFile(path, baseCommit, headRef, pkgCache, message, debug)
+		fileResult, err := annotateFile(path, baseCommit, headRef, pkgCache, debug)
 		if err != nil {
 			return err
 		}
@@ -1005,7 +974,7 @@ func bytesSplit(b []byte, sep byte) []string {
 	if len(b) == 0 {
 		return nil
 	}
-	out := []string{}
+	var out []string
 	start := 0
 	for i := range b {
 		if b[i] == sep {
@@ -1023,7 +992,7 @@ func debugf(enabled bool, format string, args ...any) {
 	if !enabled {
 		return
 	}
-	fmt.Fprintf(os.Stderr, "gocan debug: "+format+"\n", args...)
+	_, _ = fmt.Fprintf(os.Stderr, "gocan debug: "+format+"\n", args...)
 }
 
 type notice struct {
@@ -1031,7 +1000,19 @@ type notice struct {
 	Line int
 	End  int
 	Msg  string
+	Kind noticeKind
+	ID   string
 }
+
+type noticeKind int
+
+const (
+	noticeLayout noticeKind = iota
+	noticeMovedFrom
+	noticeMovedTo
+)
+
+const headRefValue = "HEAD"
 
 type noticeCollector struct {
 	max     int
@@ -1064,12 +1045,30 @@ func flushNotices() {
 	if limit > len(n.notices) || limit < 0 {
 		limit = len(n.notices)
 	}
+	if len(n.notices) <= limit {
+		sortNotices(n.notices)
+		for i := 0; i < limit; i++ {
+			printNotice(n.notices[i])
+		}
+		if n.summary {
+			if err := writeSummary(n.notices, len(n.notices)-limit); err != nil {
+				_, _ = fmt.Fprintf(os.Stderr, "gocan: summary write failed: %v\n", err)
+			}
+		}
+		noticeSink = nil
+		return
+	}
+	combined := combineNoticesByFile(n.notices)
+	sortCombined(combined)
+	if limit > len(combined) {
+		limit = len(combined)
+	}
 	for i := 0; i < limit; i++ {
-		printNotice(n.notices[i])
+		printNotice(combined[i])
 	}
 	if n.summary {
-		if err := writeSummary(n.notices, len(n.notices)-limit); err != nil {
-			fmt.Fprintf(os.Stderr, "gocan: summary write failed: %v\n", err)
+		if err := writeSummary(n.notices, len(combined)-limit); err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "gocan: summary write failed: %v\n", err)
 		}
 	}
 	noticeSink = nil
@@ -1078,6 +1077,10 @@ func flushNotices() {
 func printNotice(n notice) {
 	if n.End <= 0 || n.End < n.Line {
 		n.End = n.Line
+	}
+	if n.Line <= 0 {
+		fmt.Printf("::notice file=%s::%s\n", n.File, n.Msg)
+		return
 	}
 	if n.End == n.Line {
 		fmt.Printf("::notice file=%s,line=%d::%s\n", n.File, n.Line, n.Msg)
@@ -1097,21 +1100,35 @@ func writeSummary(notices []notice, suppressed int) error {
 		b.WriteString("No notices.\n")
 		return appendFile(path, b.String())
 	}
-	for _, n := range notices {
-		b.WriteString("- ")
-		b.WriteString(n.File)
-		if n.Line > 0 {
-			fmt.Fprintf(&b, ":%d", n.Line)
-			if n.End > n.Line {
-				fmt.Fprintf(&b, "-%d", n.End)
+	grouped := groupNoticesByDir(notices)
+	dirs := make([]string, 0, len(grouped))
+	for dir := range grouped {
+		dirs = append(dirs, dir)
+	}
+	slices.Sort(dirs)
+	for _, dir := range dirs {
+		b.WriteString("**Directory:** `")
+		b.WriteString(dir)
+		b.WriteString("`\n")
+		items := grouped[dir]
+		sortNotices(items)
+		for _, n := range items {
+			b.WriteString("- ")
+			b.WriteString(n.File)
+			if n.Line > 0 {
+				_, _ = fmt.Fprintf(&b, ":%d", n.Line)
+				if n.End > n.Line {
+					_, _ = fmt.Fprintf(&b, "-%d", n.End)
+				}
 			}
+			b.WriteString(" — ")
+			b.WriteString(n.Msg)
+			b.WriteString("\n")
 		}
-		b.WriteString(" — ")
-		b.WriteString(n.Msg)
 		b.WriteString("\n")
 	}
 	if suppressed > 0 {
-		fmt.Fprintf(&b, "\n(%d additional notices suppressed in job log)\n", suppressed)
+		_, _ = fmt.Fprintf(&b, "\n(%d additional notices suppressed in job log)\n", suppressed)
 	}
 	return appendFile(path, b.String())
 }
@@ -1123,14 +1140,27 @@ func appendFile(path, content string) error {
 		return err
 	}
 	defer func() {
-		//nolint:errcheck // best-effort close for summary file.
-		_ = f.Close()
+		if err := f.Close(); err != nil {
+			log.Printf("gocan: failed to close summary file: %v", err)
+		}
 	}()
 	_, err = f.WriteString(content)
 	return err
 }
 
-func emitNotice(path string, r hunkRange, msg string) {
+func groupNoticesByDir(notices []notice) map[string][]notice {
+	grouped := make(map[string][]notice, len(notices))
+	for _, n := range notices {
+		dir := filepath.Dir(n.File)
+		if dir == "." {
+			dir = "."
+		}
+		grouped[dir] = append(grouped[dir], n)
+	}
+	return grouped
+}
+
+func emitNoticeKind(path string, r hunkRange, msg string, kind noticeKind, id string) {
 	if r.Start <= 0 {
 		return
 	}
@@ -1142,12 +1172,122 @@ func emitNotice(path string, r hunkRange, msg string) {
 		Line: r.Start,
 		End:  r.End,
 		Msg:  msg,
+		Kind: kind,
+		ID:   id,
 	}
 	if noticeSink == nil {
 		printNotice(n)
 		return
 	}
 	noticeSink.add(n)
+}
+
+func sortNotices(list []notice) {
+	sort.SliceStable(list, func(i, j int) bool {
+		pi := noticePriority(list[i].Kind)
+		pj := noticePriority(list[j].Kind)
+		if pi != pj {
+			return pi < pj
+		}
+		if list[i].File != list[j].File {
+			return list[i].File < list[j].File
+		}
+		if list[i].Line != list[j].Line {
+			return list[i].Line < list[j].Line
+		}
+		return list[i].Msg < list[j].Msg
+	})
+}
+
+func noticePriority(k noticeKind) int {
+	switch k {
+	case noticeMovedFrom:
+		return 0
+	case noticeLayout:
+		return 1
+	case noticeMovedTo:
+		return 2
+	default:
+		return 3
+	}
+}
+
+func combineNoticesByFile(list []notice) []notice {
+	type bucket struct {
+		file  string
+		kinds map[noticeKind][]string
+	}
+	buckets := map[string]*bucket{}
+	for _, n := range list {
+		b := buckets[n.File]
+		if b == nil {
+			b = &bucket{
+				file:  n.File,
+				kinds: map[noticeKind][]string{},
+			}
+			buckets[n.File] = b
+		}
+		if n.ID != "" {
+			b.kinds[n.Kind] = appendUnique(b.kinds[n.Kind], n.ID)
+		} else {
+			b.kinds[n.Kind] = appendUnique(b.kinds[n.Kind], n.Msg)
+		}
+	}
+	out := make([]notice, 0, len(buckets))
+	for _, b := range buckets {
+		out = append(out, notice{
+			File: b.file,
+			Line: 0,
+			End:  0,
+			Msg:  composeCombinedMessage(b.kinds),
+			Kind: noticeLayout,
+		})
+	}
+	return out
+}
+
+func sortCombined(list []notice) {
+	sort.SliceStable(list, func(i, j int) bool {
+		if list[i].File != list[j].File {
+			return list[i].File < list[j].File
+		}
+		return list[i].Msg < list[j].Msg
+	})
+}
+
+func appendUnique(list []string, val string) []string {
+	if slices.Contains(list, val) {
+		return list
+	}
+	return append(list, val)
+}
+
+func composeCombinedMessage(kinds map[noticeKind][]string) string {
+	var parts []string
+	if s := formatIDList(kinds[noticeMovedFrom]); s != "" {
+		parts = append(parts, "Moved from: "+s)
+	}
+	if s := formatIDList(kinds[noticeLayout]); s != "" {
+		parts = append(parts, "Layout-only: "+s)
+	}
+	if s := formatIDList(kinds[noticeMovedTo]); s != "" {
+		parts = append(parts, "Moved to: "+s)
+	}
+	if len(parts) == 0 {
+		return "Layout-only changes"
+	}
+	return strings.Join(parts, "; ")
+}
+
+func formatIDList(ids []string) string {
+	if len(ids) == 0 {
+		return ""
+	}
+	const maxItems = 3
+	if len(ids) <= maxItems {
+		return strings.Join(ids, ", ")
+	}
+	return strings.Join(ids[:maxItems], ", ") + fmt.Sprintf(", +%d more", len(ids)-maxItems)
 }
 
 func execGitCommand(args ...string) ([]byte, error) {
@@ -1187,11 +1327,11 @@ func execGitDiff(args ...string) ([]byte, error) {
 func fatal(err error) {
 	var pathErr *os.PathError
 	if errors.As(err, &pathErr) {
-		fmt.Fprintf(os.Stderr, "gocan: %v\n", pathErr)
+		_, _ = fmt.Fprintf(os.Stderr, "gocan: %v\n", pathErr)
 		os.Exit(1)
 	}
 
-	fmt.Fprintf(os.Stderr, "gocan: %v\n", err)
+	_, _ = fmt.Fprintf(os.Stderr, "gocan: %v\n", err)
 	os.Exit(1)
 }
 
@@ -1270,11 +1410,10 @@ func parseFlags() (cliOptions, []string) {
 	flag.StringVar(&opts.parentCommit, "parent-commit", "", "git parent commit for diff base (optional, used with -denoise)")
 	flag.StringVar(&opts.configPath, "config", "", "path to JSON config file")
 	flag.BoolVar(&opts.ghAnnotate, "gh-annotate", false, "emit GitHub Actions annotations for layout-only changes")
-	flag.StringVar(&opts.ghHead, "gh-head", "HEAD", "git head ref/sha for -gh-annotate")
-	flag.StringVar(&opts.ghMessage, "gh-message", "Layout-only change (canonicalization)", "GitHub Actions annotation message")
-	flag.StringVar(&opts.ghBase, "gh-base", "", "git base ref/sha for -gh-annotate (defaults to GITHUB_BASE_SHA if set)")
+	flag.StringVar(&opts.ghHead, "gh-head", "", "git head ref/sha for -gh-annotate (defaults to GITHUB_HEAD_SHA/GITHUB_HEAD_REF, otherwise HEAD)")
+	flag.StringVar(&opts.ghBase, "gh-base", "", "git base ref/sha for -gh-annotate (defaults to GITHUB_BASE_SHA/GITHUB_BASE_REF if set)")
 	flag.IntVar(&opts.ghMaxNotices, "gh-max-notices", 10, "max GitHub Actions notices to emit")
-	flag.BoolVar(&opts.ghSummary, "gh-summary", true, "write full notice list to GITHUB_STEP_SUMMARY if available")
+	flag.BoolVar(&opts.ghSkipSummary, "gh-skip-summary", false, "skip writing full notice list to GITHUB_STEP_SUMMARY")
 	flag.Parse()
 	return opts, flag.Args()
 }
@@ -1289,19 +1428,18 @@ type annotationResult struct {
 }
 
 type cliOptions struct {
-	writeFlag    bool
-	listFlag     bool
-	diffFlag     bool
-	checkFlag    bool
-	diffFile     string
-	parentCommit string
-	configPath   string
-	ghAnnotate   bool
-	ghHead       string
-	ghMessage    string
-	ghBase       string
-	ghMaxNotices int
-	ghSummary    bool
+	writeFlag     bool
+	listFlag      bool
+	diffFlag      bool
+	checkFlag     bool
+	diffFile      string
+	parentCommit  string
+	configPath    string
+	ghAnnotate    bool
+	ghHead        string
+	ghBase        string
+	ghMaxNotices  int
+	ghSkipSummary bool
 }
 
 type declOccurrence struct {
