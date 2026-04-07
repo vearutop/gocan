@@ -106,9 +106,10 @@ Config discovery:
 - `-check` exit non-zero if any file is not formatted
 - `-config` path to JSON config file
 - `-gh-annotate` emit GitHub Actions annotations for layout-only changes
-- `-gh-head` git head ref/sha for `-gh-annotate` (default `HEAD`)
-- `-gh-message` annotation message for `-gh-annotate`
-- `-gh-base` git base ref/sha for `-gh-annotate` (defaults to `GITHUB_BASE_SHA`, falls back to `origin/main` if empty)
+- `-gh-head` git head ref/sha for `-gh-annotate` (defaults to `GITHUB_HEAD_SHA`/`GITHUB_HEAD_REF`, otherwise `HEAD`)
+- `-gh-base` git base ref/sha for `-gh-annotate` (defaults to `GITHUB_BASE_SHA`/`GITHUB_BASE_REF` if set)
+- `-gh-max-notices` max GitHub Actions notices to emit (default `10`)
+- `-gh-skip-summary` skip writing full notice list to `GITHUB_STEP_SUMMARY` (default `false`)
 
 If no paths are provided (or `-` is given), `gocan` reads from stdin and writes to stdout.
 
@@ -116,19 +117,39 @@ If no paths are provided (or `-` is given), `gocan` reads from stdin and writes 
 
 `gocan` can emit GitHub Actions annotations that mark layout-only changes (i.e., changes that disappear after canonicalization). This helps reviewers focus on semantic changes.
 
-Example workflow step:
+Example workflow:
 
 ```yaml
-- name: Layout-only annotations
-  env:
-    BASE_SHA: ${{ github.event.pull_request.base.sha }}
-  run: |
-    gocan -gh-annotate -gh-base "$BASE_SHA"
+name: gocan
+on:
+  pull_request:
+
+# Cancel the workflow in progress if a newer build is about to start.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  gocan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+      - name: Annotate layout-only changes
+        run: |
+          curl -sLO https://github.com/vearutop/gocan/releases/download/v0.0.3/linux_amd64.tar.gz && tar xf linux_amd64.tar.gz
+          gocan_hash=$(git hash-object ./gocan)
+          [ "$gocan_hash" == "cfcb9c334ed3e887a802f1fde35fbf7f5af2d8e8" ] || (echo "::error::unexpected hash for gocan, possible tampering: $gocan_hash" && exit 1)
+          git fetch --no-tags --depth=1 origin ${{ github.event.pull_request.base.sha }}
+          git fetch --no-tags --depth=1 origin ${{ github.event.pull_request.head.sha }}
+          ./gocan -gh-annotate -gh-base ${{ github.event.pull_request.base.sha }} -gh-head ${{ github.event.pull_request.head.sha }}
+
 ```
 
 Notes:
 - New files are ignored unless they contain declarations that existed in base (i.e., moved between files within the same package directory), in which case those moved declarations can be annotated.
-- If `-gh-base` is not provided, `gocan` uses `GITHUB_BASE_SHA` if set, otherwise tries `origin/main`, `origin/master`, `main`, `master` (in that order).
+- If `-gh-base` is not provided, `gocan` uses `GITHUB_BASE_SHA` or `GITHUB_BASE_REF` (as `origin/<ref>`). If still empty, it tries `origin/main`, `origin/master`, `main`, `master` (in that order).
+- If `-gh-head` is not provided, `gocan` uses `GITHUB_HEAD_SHA` or `GITHUB_HEAD_REF` (as `origin/<ref>`), otherwise `HEAD`.
 - Set `GOCAN_DEBUG=1` to print debug logs and a final summary to stderr.
 - In mixed files (layout-only moves plus semantic edits), annotations target only unchanged declarations whose text matches base after canonicalization.
 - Layout-only detection is package-scoped within a directory: declarations moved between files in the same directory/package can be annotated.
