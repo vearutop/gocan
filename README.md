@@ -106,6 +106,7 @@ Config discovery:
 - `-check` exit non-zero if any file is not formatted
 - `-config` path to JSON config file
 - `-gh-annotate` emit GitHub Actions annotations for layout-only changes
+- `-gh-checks` publish GitHub Checks API annotations for layout-only changes
 - `-gh-head` git head ref/sha for `-gh-annotate` (defaults to `GITHUB_HEAD_SHA`/`GITHUB_HEAD_REF`, otherwise `HEAD`)
 - `-gh-base` git base ref/sha for `-gh-annotate` (defaults to `GITHUB_BASE_SHA`/`GITHUB_BASE_REF` if set)
 - `-gh-max-notices` max GitHub Actions notices to emit (default `10`)
@@ -148,6 +149,7 @@ jobs:
 
 Notes:
 - New files are ignored unless they contain declarations that existed in base (i.e., moved between files within the same package directory), in which case those moved declarations can be annotated.
+- `-gh-checks` requires `GITHUB_TOKEN` with `checks: write` permission and `GITHUB_REPOSITORY` in the environment.
 - If `-gh-base` is not provided, `gocan` uses `GITHUB_BASE_SHA` or `GITHUB_BASE_REF` (as `origin/<ref>`). If still empty, it tries `origin/main`, `origin/master`, `main`, `master` (in that order).
 - If `-gh-head` is not provided, `gocan` uses `GITHUB_HEAD_SHA` or `GITHUB_HEAD_REF` (as `origin/<ref>`), otherwise `HEAD`.
 - Set `GOCAN_DEBUG=1` to print debug logs and a final summary to stderr.

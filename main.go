@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"go/token"
 	"io"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,6 +21,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/vearutop/gocan/internal/diff"
 	"github.com/vearutop/gocan/internal/format"
@@ -198,8 +201,8 @@ func recvTypeName(expr ast.Expr) string {
 }
 
 func runMain(opts cliOptions, paths []string) (bool, error) {
-	if opts.ghAnnotate {
-		setNoticeCollector(opts.ghMaxNotices, !opts.ghSkipSummary)
+	if opts.ghAnnotate || opts.ghChecks {
+		setNoticeCollector(opts.ghMaxNotices, !opts.ghSkipSummary, opts.ghAnnotate, opts.ghChecks)
 		defer flushNotices()
 		return false, runGHAnnotate(opts.ghBase, opts.ghHead)
 	}
@@ -725,17 +728,17 @@ func parseUnifiedRanges(unified []byte) []hunkRange {
 	return ranges
 }
 
-func prepareAnnotate(baseRef, headRef string) (string, []string, []string, bool, error) {
+func prepareAnnotate(baseRef, headRef string) (string, string, []string, []string, bool, error) {
 	var triedBase []string
 	var triedHead []string
 	resolvedBase, err := resolveBaseRef(baseRef, &triedBase)
 	if err != nil {
-		return "", nil, nil, false, err
+		return "", "", nil, nil, false, err
 	}
 	baseRef = resolvedBase
 	resolvedHead, err := resolveHeadRef(headRef, &triedHead)
 	if err != nil {
-		return "", nil, nil, false, err
+		return "", "", nil, nil, false, err
 	}
 	headRef = resolvedHead
 	debug := debugEnabled()
@@ -747,28 +750,28 @@ func prepareAnnotate(baseRef, headRef string) (string, []string, []string, bool,
 		debugf(debug, "head ref candidates tried: %s", strings.Join(triedHead, ", "))
 	}
 	if err := ensureRefAvailable(baseRef, "origin"); err != nil {
-		return "", nil, nil, debug, err
+		return "", "", nil, nil, debug, err
 	}
 	if err := ensureRefAvailable(headRef, "origin"); err != nil {
-		return "", nil, nil, debug, err
+		return "", "", nil, nil, debug, err
 	}
 	baseCommit, err := mergeBase(baseRef, headRef)
 	if err != nil {
-		return "", nil, nil, debug, err
+		return "", "", nil, nil, debug, err
 	}
 	debugf(debug, "merge base: %s", baseCommit)
 	files, err := changedGoFiles(baseCommit, headRef)
 	if err != nil {
 		if len(triedBase) > 0 {
-			return "", nil, nil, debug, fmt.Errorf("git diff failed for base %q and head %q: %w (tried: %s)", baseRef, headRef, err, strings.Join(triedBase, ", "))
+			return "", "", nil, nil, debug, fmt.Errorf("git diff failed for base %q and head %q: %w (tried: %s)", baseRef, headRef, err, strings.Join(triedBase, ", "))
 		}
-		return "", nil, nil, debug, err
+		return "", "", nil, nil, debug, err
 	}
 	moveFiles, err := moveFileList(baseCommit, headRef)
 	if err != nil {
-		return "", nil, nil, debug, err
+		return "", "", nil, nil, debug, err
 	}
-	return baseCommit, files, moveFiles, debug, nil
+	return baseCommit, headRef, files, moveFiles, debug, nil
 }
 
 func processFile(path string, opts cliOptions, cfg *format.Config, baseDir *string, cfgLoaded *bool, resolver *configResolver, out io.Writer) (bool, error) {
@@ -920,10 +923,11 @@ func runGHAnnotate(baseRef, headRef string) error {
 	if err := requireGitWorktree(); err != nil {
 		return err
 	}
-	baseCommit, files, moveFiles, debug, err := prepareAnnotate(baseRef, headRef)
+	baseCommit, resolvedHead, files, moveFiles, debug, err := prepareAnnotate(baseRef, headRef)
 	if err != nil {
 		return err
 	}
+	setNoticeHeadRef(resolvedHead)
 	if len(files) == 0 {
 		debugf(debug, "no changed .go files")
 		return nil
@@ -938,7 +942,7 @@ func runGHAnnotate(baseRef, headRef string) error {
 	)
 	for _, path := range files {
 		filesScanned++
-		fileResult, err := annotateFile(path, baseCommit, headRef, pkgCache, debug)
+		fileResult, err := annotateFile(path, baseCommit, resolvedHead, pkgCache, debug)
 		if err != nil {
 			return err
 		}
@@ -1012,23 +1016,35 @@ const (
 	noticeMovedTo
 )
 
-const headRefValue = "HEAD"
+const (
+	headRefValue               = "HEAD"
+	checkRunName               = "gocan layout-only"
+	checkRunTitle              = "gocan layout-only annotations"
+	checkRunConclusion         = "neutral"
+	checkAnnotationsPerRequest = 50
+	maxCheckAnnotations        = 1000
+)
 
 type noticeCollector struct {
-	max     int
-	summary bool
-	notices []notice
+	max             int
+	summary         bool
+	emitAnnotations bool
+	emitChecks      bool
+	checksHeadRef   string
+	notices         []notice
 }
 
 var noticeSink *noticeCollector
 
-func setNoticeCollector(maxNotices int, summary bool) {
+func setNoticeCollector(maxNotices int, summary bool, emitAnnotations bool, emitChecks bool) {
 	if maxNotices < 0 {
 		maxNotices = 0
 	}
 	noticeSink = &noticeCollector{
-		max:     maxNotices,
-		summary: summary,
+		max:             maxNotices,
+		summary:         summary,
+		emitAnnotations: emitAnnotations,
+		emitChecks:      emitChecks,
 	}
 }
 
@@ -1036,42 +1052,63 @@ func (c *noticeCollector) add(n notice) {
 	c.notices = append(c.notices, n)
 }
 
+func setNoticeHeadRef(headRef string) {
+	if noticeSink == nil {
+		return
+	}
+	noticeSink.checksHeadRef = headRef
+}
+
 func flushNotices() {
 	if noticeSink == nil {
 		return
 	}
 	n := noticeSink
-	limit := n.max
-	if limit > len(n.notices) || limit < 0 {
-		limit = len(n.notices)
-	}
-	if len(n.notices) <= limit {
-		sortNotices(n.notices)
-		for i := 0; i < limit; i++ {
-			printNotice(n.notices[i])
-		}
-		if n.summary {
-			if err := writeSummary(n.notices, len(n.notices)-limit); err != nil {
-				_, _ = fmt.Fprintf(os.Stderr, "gocan: summary write failed: %v\n", err)
-			}
-		}
-		noticeSink = nil
-		return
-	}
-	combined := combineNoticesByFile(n.notices)
-	sortCombined(combined)
-	if limit > len(combined) {
-		limit = len(combined)
-	}
-	for i := 0; i < limit; i++ {
-		printNotice(combined[i])
-	}
+	logSuppressed := n.emitAnnotationNotices()
 	if n.summary {
-		if err := writeSummary(n.notices, len(combined)-limit); err != nil {
+		if err := writeSummary(n.notices, logSuppressed); err != nil {
 			_, _ = fmt.Fprintf(os.Stderr, "gocan: summary write failed: %v\n", err)
 		}
 	}
+	if n.emitChecks {
+		if err := publishCheckRun(n); err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "gocan: checks publish failed: %v\n", err)
+		}
+	}
 	noticeSink = nil
+}
+
+func (c *noticeCollector) emitAnnotationNotices() int {
+	if !c.emitAnnotations {
+		return 0
+	}
+	limit := c.max
+	if limit > len(c.notices) || limit < 0 {
+		limit = len(c.notices)
+	}
+	if len(c.notices) <= limit {
+		sortNotices(c.notices)
+		for i := 0; i < limit; i++ {
+			printNotice(c.notices[i])
+		}
+		return 0
+	}
+	combined := combineNoticesByFile(c.notices)
+	sortCombined(combined)
+	if len(combined) > limit {
+		dirCombined := combineNoticesByDir(c.notices)
+		sortCombined(dirCombined)
+		limit = min(limit, len(dirCombined))
+		for i := 0; i < limit; i++ {
+			printNotice(dirCombined[i])
+		}
+		return len(dirCombined) - limit
+	}
+	limit = min(limit, len(combined))
+	for i := 0; i < limit; i++ {
+		printNotice(combined[i])
+	}
+	return len(combined) - limit
 }
 
 func printNotice(n notice) {
@@ -1107,7 +1144,7 @@ func writeSummary(notices []notice, suppressed int) error {
 	}
 	slices.Sort(dirs)
 	for _, dir := range dirs {
-		b.WriteString("**Directory:** `")
+		b.WriteString("**Package:** `")
 		b.WriteString(dir)
 		b.WriteString("`\n")
 		items := grouped[dir]
@@ -1246,6 +1283,49 @@ func combineNoticesByFile(list []notice) []notice {
 	return out
 }
 
+func combineNoticesByDir(list []notice) []notice {
+	type bucket struct {
+		dir   string
+		file  string
+		kinds map[noticeKind][]string
+	}
+	buckets := map[string]*bucket{}
+	for _, n := range list {
+		dir := filepath.Dir(n.File)
+		if dir == "." {
+			dir = "."
+		}
+		b := buckets[dir]
+		if b == nil {
+			b = &bucket{
+				dir:   dir,
+				file:  n.File,
+				kinds: map[noticeKind][]string{},
+			}
+			buckets[dir] = b
+		}
+		if n.File < b.file {
+			b.file = n.File
+		}
+		if n.ID != "" {
+			b.kinds[n.Kind] = appendUnique(b.kinds[n.Kind], n.ID)
+		} else {
+			b.kinds[n.Kind] = appendUnique(b.kinds[n.Kind], n.Msg)
+		}
+	}
+	out := make([]notice, 0, len(buckets))
+	for _, b := range buckets {
+		out = append(out, notice{
+			File: b.file,
+			Line: 0,
+			End:  0,
+			Msg:  composeDirMessage(b.dir, b.kinds),
+			Kind: noticeLayout,
+		})
+	}
+	return out
+}
+
 func sortCombined(list []notice) {
 	sort.SliceStable(list, func(i, j int) bool {
 		if list[i].File != list[j].File {
@@ -1279,6 +1359,10 @@ func composeCombinedMessage(kinds map[noticeKind][]string) string {
 	return strings.Join(parts, "; ")
 }
 
+func composeDirMessage(dir string, kinds map[noticeKind][]string) string {
+	return "Package " + dir + ": " + composeCombinedMessage(kinds)
+}
+
 func formatIDList(ids []string) string {
 	if len(ids) == 0 {
 		return ""
@@ -1288,6 +1372,226 @@ func formatIDList(ids []string) string {
 		return strings.Join(ids, ", ")
 	}
 	return strings.Join(ids[:maxItems], ", ") + fmt.Sprintf(", +%d more", len(ids)-maxItems)
+}
+
+type checkAnnotation struct {
+	Path            string `json:"path"`
+	StartLine       int    `json:"start_line"`
+	EndLine         int    `json:"end_line"`
+	AnnotationLevel string `json:"annotation_level"`
+	Message         string `json:"message"`
+}
+
+type checkOutput struct {
+	Title       string            `json:"title"`
+	Summary     string            `json:"summary"`
+	Annotations []checkAnnotation `json:"annotations,omitempty"`
+}
+
+type checkRunCreateRequest struct {
+	Name       string      `json:"name"`
+	HeadSHA    string      `json:"head_sha"`
+	Status     string      `json:"status"`
+	Conclusion string      `json:"conclusion"`
+	Output     checkOutput `json:"output"`
+}
+
+type checkRunUpdateRequest struct {
+	Output checkOutput `json:"output"`
+}
+
+type checkRunResponse struct {
+	ID int64 `json:"id"`
+}
+
+func publishCheckRun(n *noticeCollector) error {
+	repo, token, headSHA, err := checkRunEnv(n.checksHeadRef)
+	if err != nil {
+		return err
+	}
+	annotations, summary, suppressed := prepareCheckAnnotations(n.notices)
+	id, err := createInitialCheckRun(repo, token, headSHA, annotations, summary)
+	if err != nil {
+		return err
+	}
+	debugf(debugEnabled(), "checks: created check run id=%d annotations=%d suppressed=%d", id, len(annotations), suppressed)
+	return appendCheckRunAnnotations(repo, token, id, annotations, summary)
+}
+
+func checkRunEnv(headRef string) (repo string, token string, headSHA string, err error) {
+	repo = strings.TrimSpace(os.Getenv("GITHUB_REPOSITORY"))
+	if repo == "" {
+		return "", "", "", errors.New("GITHUB_REPOSITORY is required for -gh-checks")
+	}
+	token = strings.TrimSpace(os.Getenv("GITHUB_TOKEN"))
+	if token == "" {
+		return "", "", "", errors.New("GITHUB_TOKEN is required for -gh-checks")
+	}
+	headRef = strings.TrimSpace(headRef)
+	if headRef == "" {
+		return "", "", "", errors.New("head ref is required for -gh-checks")
+	}
+	headSHA, err = resolveCommitSHA(headRef)
+	if err != nil {
+		return "", "", "", err
+	}
+	return repo, token, headSHA, nil
+}
+
+func prepareCheckAnnotations(notices []notice) ([]checkAnnotation, string, int) {
+	annotations := buildCheckAnnotations(notices)
+	suppressed := 0
+	if len(annotations) > maxCheckAnnotations {
+		suppressed = len(annotations) - maxCheckAnnotations
+		annotations = annotations[:maxCheckAnnotations]
+	}
+	return annotations, checkSummary(len(notices), suppressed), suppressed
+}
+
+func createInitialCheckRun(repo, token, headSHA string, annotations []checkAnnotation, summary string) (int64, error) {
+	firstBatch := annotations
+	if len(firstBatch) > checkAnnotationsPerRequest {
+		firstBatch = annotations[:checkAnnotationsPerRequest]
+	}
+	req := checkRunCreateRequest{
+		Name:       checkRunName,
+		HeadSHA:    headSHA,
+		Status:     "completed",
+		Conclusion: checkRunConclusion,
+		Output: checkOutput{
+			Title:       checkRunTitle,
+			Summary:     summary,
+			Annotations: firstBatch,
+		},
+	}
+	return createCheckRun(repo, token, req)
+}
+
+func appendCheckRunAnnotations(repo, token string, id int64, annotations []checkAnnotation, summary string) error {
+	for i := checkAnnotationsPerRequest; i < len(annotations); i += checkAnnotationsPerRequest {
+		end := min(i+checkAnnotationsPerRequest, len(annotations))
+		upd := checkRunUpdateRequest{
+			Output: checkOutput{
+				Title:       checkRunTitle,
+				Summary:     summary,
+				Annotations: annotations[i:end],
+			},
+		}
+		if err := updateCheckRun(repo, token, id, upd); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func buildCheckAnnotations(list []notice) []checkAnnotation {
+	out := make([]checkAnnotation, 0, len(list))
+	for _, n := range list {
+		line := n.Line
+		if line <= 0 {
+			line = 1
+		}
+		end := n.End
+		if end <= 0 || end < line {
+			end = line
+		}
+		out = append(out, checkAnnotation{
+			Path:            n.File,
+			StartLine:       line,
+			EndLine:         end,
+			AnnotationLevel: "notice",
+			Message:         n.Msg,
+		})
+	}
+	return out
+}
+
+func checkSummary(total int, suppressed int) string {
+	if total == 0 {
+		return "No layout-only notices."
+	}
+	summary := fmt.Sprintf("Layout-only notices: %d.", total)
+	if suppressed > 0 {
+		summary += fmt.Sprintf(" %d annotations suppressed to fit API limits.", suppressed)
+	}
+	summary += " See job summary for the full list."
+	return summary
+}
+
+func createCheckRun(repo, token string, req checkRunCreateRequest) (int64, error) {
+	url := fmt.Sprintf("https://api.github.com/repos/%s/check-runs", repo)
+	var resp checkRunResponse
+	if err := doGitHubRequest("POST", url, token, req, &resp); err != nil {
+		return 0, err
+	}
+	if resp.ID == 0 {
+		return 0, errors.New("check run id missing in response")
+	}
+	return resp.ID, nil
+}
+
+func updateCheckRun(repo, token string, id int64, req checkRunUpdateRequest) error {
+	url := fmt.Sprintf("https://api.github.com/repos/%s/check-runs/%d", repo, id)
+	return doGitHubRequest("PATCH", url, token, req, nil)
+}
+
+func doGitHubRequest(method, url, token string, req any, resp any) error {
+	var body io.Reader
+	if req != nil {
+		payload, err := json.Marshal(req)
+		if err != nil {
+			return err
+		}
+		body = bytes.NewReader(payload)
+	}
+	// #nosec G704 -- URL is built from fixed GitHub API base.
+	httpReq, err := http.NewRequestWithContext(context.Background(), method, url, body)
+	if err != nil {
+		return err
+	}
+	httpReq.Header.Set("Accept", "application/vnd.github+json")
+	httpReq.Header.Set("Authorization", "Bearer "+token)
+	httpReq.Header.Set("X-Github-Api-Version", "2022-11-28")
+	if req != nil {
+		httpReq.Header.Set("Content-Type", "application/json")
+	}
+	client := &http.Client{Timeout: 15 * time.Second}
+	// #nosec G704 -- URL is built from fixed GitHub API base.
+	httpResp, err := client.Do(httpReq)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := httpResp.Body.Close(); err != nil {
+			log.Printf("gocan: failed to close github response body: %v", err)
+		}
+	}()
+	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+		msg, readErr := io.ReadAll(httpResp.Body)
+		if readErr != nil {
+			return fmt.Errorf("github api %s failed: status %d (read error: %w)", method, httpResp.StatusCode, readErr)
+		}
+		if len(msg) > 0 {
+			return fmt.Errorf("github api %s failed: %s", method, strings.TrimSpace(string(msg)))
+		}
+		return fmt.Errorf("github api %s failed: status %d", method, httpResp.StatusCode)
+	}
+	if resp == nil {
+		return nil
+	}
+	return json.NewDecoder(httpResp.Body).Decode(resp)
+}
+
+func resolveCommitSHA(ref string) (string, error) {
+	out, err := execGitCommand("rev-parse", ref)
+	if err != nil {
+		return "", err
+	}
+	sha := strings.TrimSpace(string(out))
+	if sha == "" {
+		return "", errors.New("resolved head sha is empty")
+	}
+	return sha, nil
 }
 
 func execGitCommand(args ...string) ([]byte, error) {
@@ -1410,6 +1714,7 @@ func parseFlags() (cliOptions, []string) {
 	flag.StringVar(&opts.parentCommit, "parent-commit", "", "git parent commit for diff base (optional, used with -denoise)")
 	flag.StringVar(&opts.configPath, "config", "", "path to JSON config file")
 	flag.BoolVar(&opts.ghAnnotate, "gh-annotate", false, "emit GitHub Actions annotations for layout-only changes")
+	flag.BoolVar(&opts.ghChecks, "gh-checks", false, "publish GitHub Checks API annotations for layout-only changes")
 	flag.StringVar(&opts.ghHead, "gh-head", "", "git head ref/sha for -gh-annotate (defaults to GITHUB_HEAD_SHA/GITHUB_HEAD_REF, otherwise HEAD)")
 	flag.StringVar(&opts.ghBase, "gh-base", "", "git base ref/sha for -gh-annotate (defaults to GITHUB_BASE_SHA/GITHUB_BASE_REF if set)")
 	flag.IntVar(&opts.ghMaxNotices, "gh-max-notices", 10, "max GitHub Actions notices to emit")
@@ -1436,6 +1741,7 @@ type cliOptions struct {
 	parentCommit  string
 	configPath    string
 	ghAnnotate    bool
+	ghChecks      bool
 	ghHead        string
 	ghBase        string
 	ghMaxNotices  int
