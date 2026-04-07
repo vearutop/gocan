@@ -259,9 +259,9 @@ func annotateFile(path, baseCommit, headRef string, pkgCache *packageCache, debu
 		debugf(debug, "skip %s: no layout-only decls", path)
 		return annotationResult{hasChanges: true}, nil
 	}
-	_ = headSrc
-	for _, d := range annotations {
-		emitNoticeKind(path, hunkRange{Start: d.StartLine, End: d.EndLine}, "Layout-only change", noticeLayout, d.DisplayName)
+	merged := mergeLayoutAnnotations(annotations, headSrc)
+	for _, m := range merged {
+		emitNoticeKind(path, hunkRange{Start: m.start, End: m.end}, "Layout-only change", noticeLayout, formatIDList(m.names))
 	}
 	return annotationResult{hasChanges: true, annotatedDecls: len(annotations)}, nil
 }
@@ -520,6 +520,85 @@ func declsOverlapping(decls []declSpan, ranges []hunkRange) []declSpan {
 		}
 	}
 	return out
+}
+
+type mergedAnnotation struct {
+	start int
+	end   int
+	names []string
+}
+
+func mergeLayoutAnnotations(decls []declSpan, src []byte) []mergedAnnotation {
+	if len(decls) == 0 {
+		return nil
+	}
+	sort.Slice(decls, func(i, j int) bool {
+		if decls[i].StartLine != decls[j].StartLine {
+			return decls[i].StartLine < decls[j].StartLine
+		}
+		return decls[i].EndLine < decls[j].EndLine
+	})
+	lines := strings.Split(string(src), "\n")
+	var out []mergedAnnotation
+	cur := mergedAnnotation{
+		start: decls[0].StartLine,
+		end:   decls[0].EndLine,
+		names: appendName(nil, displayNameForDecl(decls[0])),
+	}
+	for _, d := range decls[1:] {
+		if canMergeLayout(cur, d, lines) {
+			if d.EndLine > cur.end {
+				cur.end = d.EndLine
+			}
+			cur.names = appendName(cur.names, displayNameForDecl(d))
+			continue
+		}
+		out = append(out, cur)
+		cur = mergedAnnotation{
+			start: d.StartLine,
+			end:   d.EndLine,
+			names: appendName(nil, displayNameForDecl(d)),
+		}
+	}
+	out = append(out, cur)
+	return out
+}
+
+func displayNameForDecl(d declSpan) string {
+	if d.DisplayName != "" {
+		return d.DisplayName
+	}
+	return d.Name
+}
+
+func appendName(list []string, name string) []string {
+	if name == "" {
+		return list
+	}
+	return appendUnique(list, name)
+}
+
+func canMergeLayout(cur mergedAnnotation, next declSpan, lines []string) bool {
+	if next.StartLine <= cur.end+1 {
+		return true
+	}
+	if next.StartLine <= 0 || cur.end <= 0 {
+		return false
+	}
+	start := cur.end + 1
+	end := next.StartLine - 1
+	if start > end {
+		return true
+	}
+	for i := start; i <= end; i++ {
+		if i < 1 || i > len(lines) {
+			return false
+		}
+		if strings.TrimSpace(lines[i-1]) != "" {
+			return false
+		}
+	}
+	return true
 }
 
 func diffOccurrencesByPackage(base, head []declOccurrence) (added, removed []declOccurrence) {
@@ -1439,13 +1518,14 @@ func checkRunEnv(headRef string) (repo string, token string, headSHA string, err
 }
 
 func prepareCheckAnnotations(notices []notice) ([]checkAnnotation, string, int) {
-	annotations := buildCheckAnnotations(notices)
-	suppressed := 0
+	combined, aggregated, suppressed := aggregateCheckNotices(notices)
+	annotations := buildCheckAnnotations(combined)
 	if len(annotations) > maxCheckAnnotations {
-		suppressed = len(annotations) - maxCheckAnnotations
+		suppressed += len(annotations) - maxCheckAnnotations
 		annotations = annotations[:maxCheckAnnotations]
 	}
-	return annotations, checkSummary(len(notices), suppressed), suppressed
+	summary := checkSummary(len(notices), len(annotations), aggregated, suppressed)
+	return annotations, summary, suppressed
 }
 
 func createInitialCheckRun(repo, token, headSHA string, annotations []checkAnnotation, summary string) (int64, error) {
@@ -1506,11 +1586,31 @@ func buildCheckAnnotations(list []notice) []checkAnnotation {
 	return out
 }
 
-func checkSummary(total int, suppressed int) string {
+func aggregateCheckNotices(list []notice) ([]notice, bool, int) {
+	if len(list) <= checkAnnotationsPerRequest {
+		return list, false, 0
+	}
+	combined := combineNoticesByFile(list)
+	sortCombined(combined)
+	if len(combined) <= checkAnnotationsPerRequest {
+		return combined, true, 0
+	}
+	dirCombined := combineNoticesByDir(list)
+	sortCombined(dirCombined)
+	if len(dirCombined) <= checkAnnotationsPerRequest {
+		return dirCombined, true, 0
+	}
+	return dirCombined[:checkAnnotationsPerRequest], true, len(dirCombined) - checkAnnotationsPerRequest
+}
+
+func checkSummary(total int, emitted int, aggregated bool, suppressed int) string {
 	if total == 0 {
 		return "No layout-only notices."
 	}
 	summary := fmt.Sprintf("Layout-only notices: %d.", total)
+	if aggregated {
+		summary += fmt.Sprintf(" Check annotations aggregated to %d entries.", emitted)
+	}
 	if suppressed > 0 {
 		summary += fmt.Sprintf(" %d annotations suppressed to fit API limits.", suppressed)
 	}
